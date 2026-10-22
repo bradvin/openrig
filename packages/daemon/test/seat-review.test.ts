@@ -137,22 +137,34 @@ describe("checked seat selection", () => {
     const { s, guard, guardedService } = guardedTmux();
     let release!: () => void;
     let entered!: () => void;
+    let holderFinished = false;
     const blocked = new Promise<void>(resolve => { release = resolve; });
     const acquired = new Promise<void>(resolve => { entered = resolve; });
-    const holding = guard.custody([s.node.id], async () => { entered(); await blocked; });
+    const holding = guard.custody([s.node.id], async () => { entered(); await blocked; holderFinished = true; });
     await acquired;
 
-    const permission = guardedService.setPermissions({ seatRef: s.ref, mode: "floor", reason: "save native choice", actor: "op" });
-    const policy = guardedService.setPolicy({ seatRef: s.ref, ref: "none", reason: "save policy", actor: "op" });
-    db.prepare(`INSERT INTO occupant_tenures(id,node_id,generation_ordinal,generation_uuid,kind)
-      VALUES (?, ?, (SELECT COALESCE(MAX(generation_ordinal), 0) + 1 FROM occupant_tenures WHERE node_id = ?), ?, ?)`)
-      .run("replacement-tenure", s.node.id, s.node.id, "replacement-generation", "fresh");
-    release();
-    await holding;
+    let requestsSettled: Promise<unknown> | undefined;
+    try {
+      db.prepare(`INSERT INTO occupant_tenures(id,node_id,generation_ordinal,generation_uuid,kind)
+        VALUES (?, ?, (SELECT COALESCE(MAX(generation_ordinal), 0) + 1 FROM occupant_tenures WHERE node_id = ?), ?, ?)`)
+        .run("replacement-tenure", s.node.id, s.node.id, "replacement-generation", "fresh");
+      const custody = vi.spyOn(guard, "custody");
+      const permission = guardedService.setPermissions({ seatRef: s.ref, mode: "floor", reason: "save native choice", actor: "op" });
+      const policy = guardedService.setPolicy({ seatRef: s.ref, ref: "none", reason: "save policy", actor: "op" });
+      requestsSettled = Promise.allSettled([permission, policy]);
+      // Unqualified choices should finish without joining the occupied guard lane.
+      expect(custody).not.toHaveBeenCalled();
+      expect(await requestsSettled).toMatchObject([
+        { status: "fulfilled", value: { ok: true } },
+        { status: "fulfilled", value: { ok: true } },
+      ]);
+      expect(holderFinished).toBe(false);
+    } finally {
+      release();
+      await holding;
+      await requestsSettled;
+    }
 
-    expect((await permission).ok).toBe(true);
-    const applied = await policy;
-    expect(applied.ok).toBe(true);
     expect(db.prepare("SELECT mode FROM node_permission_selections WHERE node_id = ?").get(s.node.id)).toEqual({ mode: "floor" });
     expect(db.prepare("SELECT permission_policy FROM nodes WHERE id = ?").get(s.node.id)).toEqual({ permission_policy: "none" });
 

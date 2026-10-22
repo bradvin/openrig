@@ -779,10 +779,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         };
       }
     }
-    // Codex rejects writable --add-dir roots under a read-only profile. Only
-    // suppress OpenRig's generated roots when that profile controls the sandbox.
+    // Codex rejects writable --add-dir roots under a read-only sandbox. Only
+    // suppress OpenRig's generated roots when later project layers cannot make it writable.
     const suppressAutoAddDirs = Boolean(!binding.codexRebuildPermissions && profile
-      && posture === profileArg && this.profileDeclaresReadOnly(profile));
+      && posture === profileArg && this.profileRemainsReadOnly(profile, binding.cwd));
     const teamWorkspaceArg = !binding.codexRebuildPermissions && binding.teamPermissionDefault && !profile
       && appliedLaunch.state === "observed" && appliedLaunch.value === "workspace-write"
       ? codexTeamWorkspaceArg(this.prepareTeamWorkspace, name) : "";
@@ -823,15 +823,30 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return root ? ` --add-dir ${shellQuote(root)}` : "";
   }
 
-  private profileDeclaresReadOnly(profile: string): boolean {
+  /** Suppress roots only when a read-only profile has no possibly writable project layer. */
+  private profileRemainsReadOnly(profile: string, cwd: string): boolean {
     const root = this.codexHome ?? nodePath.join(this.fs.homedir ?? os.homedir(), ".codex");
     const path = nodePath.join(root, `${profile}.config.toml`);
     if (!this.fs.exists(path)) return false;
     try {
       const value = parseToml(this.fs.readFile(path));
-      return value.sandbox_mode === "read-only";
+      if (value.sandbox_mode !== "read-only" || !nodePath.isAbsolute(cwd)) return false;
+      // Codex loads trusted project config from the project root toward cwd. Search
+      // every ancestor: an extra file above its chosen root only keeps the old roots.
+      for (let dir = nodePath.normalize(cwd);;) {
+        const projectPath = nodePath.join(dir, ".codex", "config.toml");
+        // At the home ancestor this is the user config, which loaded before the profile.
+        if (projectPath !== nodePath.join(root, "config.toml") && this.fs.exists(projectPath)) {
+          const project = parseToml(this.fs.readFile(projectPath));
+          if (project.sandbox_mode !== undefined && project.sandbox_mode !== "read-only") return false;
+          if (project.default_permissions !== undefined) return false;
+        }
+        const parent = nodePath.dirname(dir);
+        if (parent === dir) return true;
+        dir = parent;
+      }
     } catch {
-      // The existing Codex profile preflight owns malformed-profile errors.
+      // Preflight owns profile errors; unreadable project state keeps prior roots.
       return false;
     }
   }

@@ -573,6 +573,82 @@ describe("Codex runtime adapter", () => {
     expect(resolveGitAddDirs).not.toHaveBeenCalled();
   });
 
+  it("keeps generated roots when a project layer makes a read-only profile writable", async () => {
+    const codexHome = "/private/codex";
+    const projectPath = "/project/.codex/config.toml";
+    const projectContent = 'sandbox_mode = "workspace-write"\n';
+    const fsOps = mockFs({
+      [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+      [projectPath]: projectContent,
+    });
+    const writeFile = vi.spyOn(fsOps, "writeFile");
+    const options = [
+      { name: "dev-qa@test-rig" },
+      { name: "dev-qa@test-rig", resumeToken: "sess-456" },
+      { name: "dev-qa@test-rig", forkSource: { kind: "native_id" as const, value: "parent-thread-id", pendingIdAllowed: true } },
+    ];
+    for (const opts of options) {
+      const proof = provenCodexResume("sess-456");
+      const tmux = mockTmux({ getPanePid: proof.getPanePid });
+      const adapter = new CodexRuntimeAdapter({
+        tmux, fsOps, codexHome, resolveGitAddDirs: async () => ["/project/.git"],
+        listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence,
+        sleep: async () => {}, verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+      });
+
+      const result = await adapter.launchHarness({ ...makeBinding("/project/src"), codexConfigProfile: "locked" }, opts);
+
+      expect(result, JSON.stringify(opts)).toMatchObject({ ok: true });
+      const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+      expect(command).toContain("-p 'locked'");
+      if (!opts.resumeToken && !opts.forkSource) expect(command).toContain("--add-dir '/project/.git'");
+      expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+    }
+    expect(fsOps.readFile(projectPath)).toBe(projectContent);
+    expect(writeFile).not.toHaveBeenCalledWith(projectPath, expect.anything());
+  });
+
+  it("keeps generated roots when a project config layer cannot be parsed", async () => {
+    const codexHome = "/private/codex";
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({
+      tmux, codexHome, fsOps: mockFs({
+        [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        "/project/.codex/config.toml": "sandbox_mode = [\n",
+      }),
+      resolveGitAddDirs: async () => ["/project/.git"],
+      listProcesses: () => [], sleep: async () => {},
+      verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+    });
+
+    const result = await adapter.launchHarness({ ...makeBinding(), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
+
+    expect(result.ok).toBe(true);
+    const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+    expect(command).toContain("--add-dir '/project/.git'");
+    expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+  });
+
+  it("does not treat the lower-priority user config as a project override", async () => {
+    const codexHome = "/home/test/.codex";
+    const resolveGitAddDirs = vi.fn(async () => ["/home/test/project/.git"]);
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({
+      tmux, codexHome, fsOps: mockFs({
+        [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        [`${codexHome}/config.toml`]: 'sandbox_mode = "workspace-write"\n',
+      }),
+      resolveGitAddDirs, listProcesses: () => [], sleep: async () => {},
+      verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+    });
+
+    const result = await adapter.launchHarness({ ...makeBinding("/home/test/project"), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
+
+    expect(result.ok).toBe(true);
+    expect(vi.mocked(tmux.sendText).mock.calls[0]?.[1]).not.toContain("--add-dir");
+    expect(resolveGitAddDirs).not.toHaveBeenCalled();
+  });
+
   it("keeps generated writable roots for writable, absent and unreadable profiles, and an overriding posture", async () => {
     const codexHome = "/private/codex";
     const files = mockFs({

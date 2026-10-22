@@ -649,6 +649,53 @@ describe("Codex runtime adapter", () => {
     expect(resolveGitAddDirs).not.toHaveBeenCalled();
   });
 
+  it("keeps generated roots when named permissions or unreadable user config leave the sandbox uncertain", async () => {
+    const codexHome = "/home/test/.codex";
+    for (const files of [
+      { [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\ndefault_permissions = ":workspace"\n' },
+      { [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        [`${codexHome}/config.toml`]: 'default_permissions = ":workspace"\n' },
+      { [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        [`${codexHome}/config.toml`]: 'default_permissions = [\n' },
+    ]) {
+      const tmux = mockTmux();
+      const adapter = new CodexRuntimeAdapter({
+        tmux, codexHome, fsOps: mockFs(files),
+        resolveGitAddDirs: async () => ["/home/test/project/.git"],
+        listProcesses: () => [], sleep: async () => {},
+        verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+      });
+
+      const result = await adapter.launchHarness({ ...makeBinding("/home/test/project"), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
+
+      expect(result.ok).toBe(true);
+      const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+      expect(command).toContain("--add-dir '/home/test/project/.git'");
+      expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+    }
+  });
+
+  it("honors a closer read-only project layer over a writable ancestor", async () => {
+    const codexHome = "/private/codex";
+    const resolveGitAddDirs = vi.fn(async () => ["/project/.git"]);
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({
+      tmux, codexHome, fsOps: mockFs({
+        [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        "/project/.codex/config.toml": 'sandbox_mode = "workspace-write"\n',
+        "/project/src/.codex/config.toml": 'sandbox_mode = "read-only"\n',
+      }),
+      resolveGitAddDirs, listProcesses: () => [], sleep: async () => {},
+      verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+    });
+
+    const result = await adapter.launchHarness({ ...makeBinding("/project/src"), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
+
+    expect(result.ok).toBe(true);
+    expect(vi.mocked(tmux.sendText).mock.calls[0]?.[1]).not.toContain("--add-dir");
+    expect(resolveGitAddDirs).not.toHaveBeenCalled();
+  });
+
   it("keeps generated writable roots for writable, absent and unreadable profiles, and an overriding posture", async () => {
     const codexHome = "/private/codex";
     const files = mockFs({

@@ -133,6 +133,37 @@ describe("checked seat selection", () => {
     return { s, calls, adapter, guard, guardedService };
   }
 
+  it("keeps unqualified setters available when guard work is queued and the occupant changes", async () => {
+    const { s, guard, guardedService } = guardedTmux();
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const acquired = new Promise<void>(resolve => { entered = resolve; });
+    const holding = guard.custody([s.node.id], async () => { entered(); await blocked; });
+    await acquired;
+
+    const permission = guardedService.setPermissions({ seatRef: s.ref, mode: "floor", reason: "save native choice", actor: "op" });
+    const policy = guardedService.setPolicy({ seatRef: s.ref, ref: "none", reason: "save policy", actor: "op" });
+    db.prepare(`INSERT INTO occupant_tenures(id,node_id,generation_ordinal,generation_uuid,kind)
+      VALUES (?, ?, (SELECT COALESCE(MAX(generation_ordinal), 0) + 1 FROM occupant_tenures WHERE node_id = ?), ?, ?)`)
+      .run("replacement-tenure", s.node.id, s.node.id, "replacement-generation", "fresh");
+    release();
+    await holding;
+
+    expect((await permission).ok).toBe(true);
+    const applied = await policy;
+    expect(applied.ok).toBe(true);
+    expect(db.prepare("SELECT mode FROM node_permission_selections WHERE node_id = ?").get(s.node.id)).toEqual({ mode: "floor" });
+    expect(db.prepare("SELECT permission_policy FROM nodes WHERE id = ?").get(s.node.id)).toEqual({ permission_policy: "none" });
+
+    const reaffirmed = await guardedService.setPolicy({ seatRef: s.ref, ref: "none", reason: "keep policy", actor: "op" });
+    expect(reaffirmed).toMatchObject({ ok: true, changed: false });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'node.policy_changed'").get()).toEqual({ n: 2 });
+    const stale = await guardedService.setPermissions({ seatRef: s.ref, mode: "inherit", reason: "stale choice", actor: "op", expected: s.descriptor.review });
+    expect(stale.ok ? "ok" : stale.code).toBe("selection_changed");
+    expect(db.prepare("SELECT mode FROM node_permission_selections WHERE node_id = ?").get(s.node.id)).toEqual({ mode: "floor" });
+  });
+
   it("checks the public guarded tmux kill before detach and kill using its immutable session id", async () => {
     const { s, calls, adapter, guard } = guardedTmux();
     const stages: string[] = [];

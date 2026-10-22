@@ -755,7 +755,7 @@ export class SeatLifecycleService {
     if ("code" in resolved) return resolved;
     const guard = this.tmuxAdapter.deliveryGuard;
     if (input.expected && !guard) return { ok: false, code: "checked_contract_unavailable", message: "Checked seat changes require the delivery guard." };
-    if (guard && !guard.ownsCustody(resolved.nodeId)) {
+    if (input.expected && guard && !guard.ownsCustody(resolved.nodeId)) {
       try { return await guard.custody([resolved.nodeId], () => this.setPermissions(input)); }
       catch (error) {
         if (input.expected && error instanceof DeliveryGuardError && error.code === "guard_target_changed") return this.changedWhileWaiting(input.seatRef);
@@ -832,7 +832,7 @@ export class SeatLifecycleService {
     if ("code" in resolved) return resolved;
     const guard = this.tmuxAdapter.deliveryGuard;
     if (input.expected && !guard) return { ok: false, code: "checked_contract_unavailable", message: "Checked seat changes require the delivery guard." };
-    if (guard && !guard.ownsCustody(resolved.nodeId)) {
+    if (input.expected && guard && !guard.ownsCustody(resolved.nodeId)) {
       try { return await guard.custody([resolved.nodeId], () => this.setPolicy(input)); }
       catch (error) {
         if (input.expected && error instanceof DeliveryGuardError && error.code === "guard_target_changed") return this.changedWhileWaiting(input.seatRef);

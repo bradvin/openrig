@@ -100,6 +100,7 @@ interface PreparedCodexLaunch {
   appliedLaunch: AppliedLaunchObservation;
   postureArg: string;
   queueStateDirArg: string;
+  suppressAutoAddDirs: boolean;
   daemonOptOut: boolean;
   daemonArg: string;
   networkArg: string;
@@ -610,7 +611,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     // Only a launch that starts a conversation may install the core plugin; a resume never does.
     const prepared = await this.prepareLaunch(binding, opts.name, undefined, { installCorePlugin: !opts.resumeToken });
     if (!prepared.ok) return prepared;
-    const { modelArg, effortArg, appliedLaunch, postureArg, queueStateDirArg, daemonArg, networkArg } = prepared;
+    const { modelArg, effortArg, appliedLaunch, postureArg, queueStateDirArg, daemonArg, networkArg, suppressAutoAddDirs } = prepared;
 
     // Fork branch: `codex fork <parent_thread_id>`. Captures the NEW thread id
     // post-fork. Parent thread id is NOT persisted onto the new seat record
@@ -666,7 +667,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     // Issue #121: only the fresh launch adds git metadata dirs; resume and fork never did.
     const gitDirArg = opts.resumeToken || binding.codexRebuildPermissions
       ? ""
-      : (await this.resolveGitAddDirs(binding.cwd)).map((dir) => ` --add-dir ${shellQuote(dir)}`).join("");
+      : suppressAutoAddDirs ? "" : (await this.resolveGitAddDirs(binding.cwd)).map((dir) => ` --add-dir ${shellQuote(dir)}`).join("");
     const cmd = opts.resumeToken
       // 0.5.2-07 A2-3: the pod-aware RESUME path threads the SPEC model too (reverted before — the
       // grounding map assumed codex parity with the claude adapter, but only fresh emitted -m).
@@ -760,6 +761,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       // The running Codex already loaded its profile; drift in -p is the caller's to compare.
       return { ok: true, model, modelArg, effort, effortArg, profile, appliedLaunch, postureArg,
         queueStateDirArg: running.addDirs.map((dir) => ` --add-dir ${shellQuote(dir)}`).join(""),
+        suppressAutoAddDirs: false,
         daemonOptOut: running.daemonOptOut, daemonArg: running.daemonOptOut ? " --no-daemon" : "",
         networkArg: running.networkOverride ? ` -c ${shellQuote(CODEX_NETWORK_DEFAULT_OVERRIDE)}` : "" };
     }
@@ -777,10 +779,15 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         };
       }
     }
+    // Codex rejects writable --add-dir roots under a read-only profile. Only
+    // suppress OpenRig's generated roots when that profile controls the sandbox.
+    const suppressAutoAddDirs = Boolean(!binding.codexRebuildPermissions && profile
+      && posture === profileArg && this.profileDeclaresReadOnly(profile));
     const teamWorkspaceArg = !binding.codexRebuildPermissions && binding.teamPermissionDefault && !profile
       && appliedLaunch.state === "observed" && appliedLaunch.value === "workspace-write"
       ? codexTeamWorkspaceArg(this.prepareTeamWorkspace, name) : "";
-    const queueStateDirArg = binding.codexRebuildPermissions ? "" : teamWorkspaceArg || this.buildQueueStateAddDirArg(name);
+    const queueStateDirArg = binding.codexRebuildPermissions || suppressAutoAddDirs
+      ? "" : teamWorkspaceArg || this.buildQueueStateAddDirArg(name);
     // #69: one daemon-support decision for this launch, for the Codex the seat pane runs
     // (its cwd, the launch PATH), applied to fresh, fork and resume.
     const daemonSupport = this.detectDaemonSupport ? await this.detectDaemonSupport(binding.cwd) : undefined;
@@ -795,7 +802,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
 
     // The launch facts keep the probed daemon choice, so a printed recovery command can repeat it; no probe, no fact.
     const launchFacts = daemonSupport ? { ...appliedLaunch, daemonOptOut } : appliedLaunch;
-    return { ok: true, model, modelArg, effort, effortArg, profile, appliedLaunch: launchFacts, postureArg, queueStateDirArg, daemonOptOut, daemonArg, networkArg };
+    return { ok: true, model, modelArg, effort, effortArg, profile, appliedLaunch: launchFacts, postureArg, queueStateDirArg, suppressAutoAddDirs, daemonOptOut, daemonArg, networkArg };
   }
 
   private resumeCore(prepared: PreparedCodexLaunch, resumeToken: string, binding: NodeBinding): string {
@@ -814,6 +821,19 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       || nodePath.join(this.fs.homedir ?? os.homedir(), ".openrig", "shared-docs");
     const root = codexQueueStateRoot(sessionName, sharedDocsRoot);
     return root ? ` --add-dir ${shellQuote(root)}` : "";
+  }
+
+  private profileDeclaresReadOnly(profile: string): boolean {
+    const root = this.codexHome ?? nodePath.join(this.fs.homedir ?? os.homedir(), ".codex");
+    const path = nodePath.join(root, `${profile}.config.toml`);
+    if (!this.fs.exists(path)) return false;
+    try {
+      const value = parseToml(this.fs.readFile(path));
+      return value.sandbox_mode === "read-only";
+    } catch {
+      // The existing Codex profile preflight owns malformed-profile errors.
+      return false;
+    }
   }
 
   private async captureProbeScreen(target: string): Promise<string> {

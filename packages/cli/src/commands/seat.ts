@@ -5,6 +5,7 @@ import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 import { shellQuote } from "../cross-host-executor.js";
 import { seatLaunchAdditionLines, type SeatLaunchAdditionsView } from "../seat-launch-additions-lines.js";
+import { readExpectedSeatReview } from "../seat-review-file.js";
 
 export type SeatDeps = StatusDeps;
 
@@ -312,6 +313,12 @@ export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promis
     console.log(JSON.stringify(result.data, null, json ? undefined : 2));
     if (result.status >= 400) process.exitCode = result.status >= 500 ? 2 : 1;
   };
+  cmd.command("review").argument("<seat>", "Canonical session name or logical seat ref")
+    .option("--json", "Machine-readable review token and descriptor")
+    .description("Read the current seat and native-history selection for a checked mutation")
+    .action(async (seat: string, opts: { json?: boolean }) => {
+      await guardRequest("GET", `/api/seat/review/${encodeURIComponent(seat)}`, undefined, opts.json);
+    });
   cmd.command("set-typing-guard").argument("<seat>")
     .option("--enabled <boolean>", "Compatibility: true selects hold; false selects off")
     .option("--mode <mode>", "off, draft-aware, openrig-urgent, urgent-only, sends-only or hold; choose this or --enabled")
@@ -629,11 +636,13 @@ identity remains unverified; a version number alone cannot clear it.
     .requiredOption("--mode <mode>", "floor, full_bypass, inherit, or a Claude mode supported by the bound managed launch context")
     .requiredOption("--reason <text>", "Reason for the audited future-launch selection")
     .option("--operator <address>", "Operator recorded on the audit event when no session identity is present")
+    .option("--expected-file <path>", "JSON from rig seat review; refuse if the seat changed")
     .option("--json", "JSON output for agents")
     .description("Select native permissions for future managed launches; no relaunch or work-posture change")
     .addHelpText("after", "\nUse inherit to clear this seat's explicit selection. Current native processes, history, rules and hooks remain unchanged. A later lifecycle action needs its own authorization.")
-    .action(async (seat: string, opts: { mode: string; reason: string; operator?: string; json?: boolean }) => {
-      await runLifecycleVerb("set-permissions", seat, { mode: opts.mode, reason: opts.reason, operator: opts.operator }, opts, data => {
+    .action(async (seat: string, opts: { mode: string; reason: string; operator?: string; expectedFile?: string; json?: boolean }) => {
+      const expected = await readExpectedSeatReview(opts.expectedFile);
+      await runLifecycleVerb("set-permissions", seat, { mode: opts.mode, reason: opts.reason, operator: opts.operator, ...(expected ? { expected } : {}) }, opts, data => {
         const selection = data["to"] as { mode: string } | null;
         console.log(`Permission mode: ${selection?.mode ?? "inherit"}${data["changed"] === false ? " (unchanged)" : " (audited)"}`);
         console.log(String(data["effect"]));
@@ -937,6 +946,7 @@ Examples:
     .argument("<seat>", "Canonical session name or logical seat ref")
     .requiredOption("--reason <text>", "Audit reason recorded on the session.stopped event")
     .option("--operator <address>", "Operator recorded on the audit event")
+    .option("--expected-file <path>", "JSON from rig seat review; refuse if the seat changed")
     .option("--json", "JSON output for agents")
     .description("Stop exactly one LIVE managed seat (kills only that seat's tmux session; audited)")
     .addHelpText("after", `
@@ -950,8 +960,9 @@ Running counts still exclude the stopped seat; stopping every seat leaves the
 rig stopped. Examples:
   rig seat stop dev-impl@my-rig --reason "wave boundary retirement"
   rig seat stop dev.impl --reason "stuck occupant" --json`)
-    .action(async (seat: string, opts: { reason: string; operator?: string; json?: boolean }) => {
-      await runLifecycleVerb("stop", seat, { reason: opts.reason, operator: opts.operator }, opts, (data) => {
+    .action(async (seat: string, opts: { reason: string; operator?: string; expectedFile?: string; json?: boolean }) => {
+      const expected = await readExpectedSeatReview(opts.expectedFile);
+      await runLifecycleVerb("stop", seat, { reason: opts.reason, operator: opts.operator, ...(expected ? { expected } : {}) }, opts, (data) => {
         const s = data["seat"] as { logicalId?: string; rigName?: string } | undefined;
         console.log(`Stopped ${String(data["sessionName"])} (seat ${s?.logicalId}@${s?.rigName}).`);
         console.log("Session marked exited, binding cleared; siblings untouched. Relaunch via the normal launch surface.");

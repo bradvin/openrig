@@ -201,6 +201,17 @@ describe("exact session targets for capture, session environment and pipe-pane",
       expect(calls.map((c) => c[c.indexOf(c[1] === "detach-client" ? "-s" : "-t") + 1])).toEqual(["$1", "$1"]);
     });
 
+    it(`${mode}: reviewed-state assertions run before detach and before immutable kill`, async () => {
+      const sessions: Sessions = { ...onlySibling(), [GONE]: { screen: "OWN-SCREEN\n", env: {} } };
+      const { a, calls } = adapter(sessions);
+      const unchecked = (a as unknown as { killSessionUnchecked(name: string, check: (afterDetach: boolean) => void): Promise<{ ok: boolean }> }).killSessionUnchecked;
+      await expect(unchecked.call(a, "$1", () => { throw new Error("stale"); })).rejects.toThrow("stale");
+      expect(calls).toEqual([]);
+      await expect(unchecked.call(a, "$1", afterDetach => { if (afterDetach) throw new Error("stale after detach"); })).rejects.toThrow("stale after detach");
+      expect(calls.map(c => c[1])).toEqual(["detach-client"]);
+      expect(Object.keys(sessions)).toEqual([SIBLING, GONE]);
+    });
+
     it(`${mode}: a live session's command, pid, window and kill act on itself only`, async () => {
       const sessions: Sessions = { ...onlySibling(), [GONE]: { screen: "OWN-SCREEN\n", env: {}, command: "codex", pid: 7, size: "80x24" } };
       const { a } = adapter(sessions);

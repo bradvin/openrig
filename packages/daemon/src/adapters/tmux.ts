@@ -67,7 +67,7 @@ export function defaultTmuxFileOps(): TmuxFileOps {
 
 export type TmuxResult =
   | { ok: true; warnings?: string[] }
-  | { ok: false; code: string; message: string };
+  | { ok: false; code: string; message: string; afterDetach?: boolean };
 
 export interface TmuxSession {
   name: string;
@@ -495,6 +495,7 @@ export class TmuxAdapter {
         return guard.input(identity, () => write(pane, () => guard.checkInput(identity)));
       });
     } catch (error) {
+      if ((error as { reviewedStopChanged?: boolean })?.reviewedStopChanged) throw error;
       return { ok: false, code: (error as { code?: string }).code ?? "guard_target_unknown", message: String((error as Error).message) };
     }
   }
@@ -904,14 +905,14 @@ export class TmuxAdapter {
     }
   }
 
-  async killSession(name: string): Promise<TmuxResult> {
+  async killSession(name: string, assertReviewedState?: (afterDetach: boolean) => void): Promise<TmuxResult> {
     if (this.deliveryGuard) {
       return this.guardedInput(name, async pane => {
         const stdout = await this.run(["tmux", "display-message", "-p", "-t", pane, "#{session_id}"], `tmux display-message -p -t ${shellQuote(pane)} '#{session_id}'`);
         const sessionId = stdout.trim();
         if (!/^\$\d+$/.test(sessionId)) return { ok: false, code: "guard_target_unknown", message: "Cannot establish immutable session identity; no session killed." };
         const kill = async () => {
-          const result = await this.killSessionUnchecked(sessionId);
+          const result = await this.killSessionUnchecked(sessionId, assertReviewedState);
           if (result.ok) { this.freshProbes.delete(name); this.freshProbes.delete(pane); this.freshManaged.delete(name); }
           return result;
         };
@@ -919,13 +920,14 @@ export class TmuxAdapter {
         return this.deliveryGuard!.input(this.freshManaged.get(name)?.nodeId ?? name, kill);
       }, true);
     }
-    return this.killSessionUnchecked(name);
+    return this.killSessionUnchecked(name, assertReviewedState);
   }
 
-  private async killSessionUnchecked(name: string): Promise<TmuxResult> {
+  private async killSessionUnchecked(name: string, assertReviewedState?: (afterDetach: boolean) => void): Promise<TmuxResult> {
     // The guarded path passes the immutable `$N` id, which stays as it is; a bare name is made exact.
     const session = exactTarget(name, "session");
     // Detach first so `detach-on-destroy off` cannot switch views onto another session.
+    assertReviewedState?.(false);
     try {
       await this.run(["tmux", "detach-client", "-s", session],
         `tmux detach-client -s ${shellQuote(session)}`);
@@ -934,6 +936,7 @@ export class TmuxAdapter {
       const message = err instanceof Error ? err.message : String(err);
       if (!message.toLowerCase().includes("no current client")) return classifyWriteError(err);
     }
+    assertReviewedState?.(true);
     try {
       await this.run(["tmux", "kill-session", "-t", session],
         `tmux kill-session -t ${shellQuote(session)}`);
@@ -942,7 +945,8 @@ export class TmuxAdapter {
       if (pane) this.freshProbes.delete(pane);
       return { ok: true };
     } catch (err) {
-      return classifyWriteError(err);
+      const failure = classifyWriteError(err);
+      return assertReviewedState && !failure.ok ? { ...failure, afterDetach: true } : failure;
     }
   }
 

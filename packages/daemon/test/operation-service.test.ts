@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { migrate } from "../src/db/migrate.js";
@@ -13,6 +14,7 @@ import { OperationService, normalizedOperationRoot, operationRequestHash, parseO
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { operationValidationFields, validateOperationPublicResult } from "../src/domain/operation-public-result.js";
 
+const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
@@ -61,7 +63,7 @@ describe("operation receipt foundation", () => {
       ops.beginExternalStep({ operationId: id, step: "launch:lead", kind: "external.launch",
         phase: "launching" });
       process.kill(process.pid, "SIGKILL");
-    `, path, id], { cwd: process.cwd(), env: { ...process.env, HOME: dirs[dirs.length - 1],
+    `, path, id], { cwd: REPO_ROOT, env: { ...process.env, HOME: dirs[dirs.length - 1],
       OPENRIG_HOME: dirs[dirs.length - 1] }, encoding: "utf8", timeout: 15_000 });
     expect(child.signal).toBe("SIGKILL");
     const reopened = new Database(path);
@@ -153,7 +155,7 @@ describe("operation receipt foundation", () => {
           }).immediate();
         }
         process.kill(process.pid, "SIGKILL");
-      `, path, id, boundary, priorId ?? ""], { cwd: process.cwd(), env: { ...process.env,
+      `, path, id, boundary, priorId ?? ""], { cwd: REPO_ROOT, env: { ...process.env,
         HOME: dir, OPENRIG_HOME: dir }, encoding: "utf8", timeout: 20_000 });
       expect(child.signal, child.stderr || child.stdout).toBe("SIGKILL");
       const reopened = new Database(path);

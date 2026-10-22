@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { migrate } from "../src/db/migrate.js";
@@ -12,6 +13,7 @@ import { PodRepository } from "../src/domain/pod-repository.js";
 import { OperationRepository } from "../src/domain/operation-repository.js";
 import { OperationService } from "../src/domain/operation-service.js";
 
+const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const SPEC = `version: "0.2"
 name: receipt-consumer
 pods:
@@ -134,7 +136,7 @@ describe("operation receipt real consumer crash boundaries", () => {
             }).immediate();
           }
           kill();
-        `, path, id, boundary, targetId, dir, SPEC], { cwd: process.cwd(),
+        `, path, id, boundary, targetId, dir, SPEC], { cwd: REPO_ROOT,
           env: { ...process.env, HOME: dir, OPENRIG_HOME: dir, CODEX_HOME: join(dir, ".codex") },
           encoding: "utf8", timeout: 20_000 });
         expect(child.signal, child.stderr || child.stdout).toBe("SIGKILL");

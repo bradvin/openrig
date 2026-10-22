@@ -48,16 +48,6 @@ import { CommunityHarnessRuntimeAdapter, seatAdapter } from "../adapters/communi
 import { sessionCommunityHarnessSelect } from "./session-registry.js";
 import { seatLaunchAdditionsReport } from "./seat-launch-additions.js";
 import { seatSkillPaths } from "./seat-skill-storage.js";
-import { readSeatReview, sameSeatReview, validSeatReview, type SeatReview, type SeatReviewDescriptor } from "./seat-review.js";
-import { DeliveryGuardError } from "./seat-delivery-guard.js";
-
-class ReviewedStopChanged extends Error {
-  readonly reviewedStopChanged = true;
-  constructor(readonly current: SeatReviewDescriptor | null, readonly afterDetach: boolean) { super("The reviewed seat changed during stop."); }
-}
-class SeatSelectionChanged extends Error {
-  constructor(readonly refusal: SeatRefusal) { super(refusal.message); }
-}
 
 /**
  * S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model, single-seat stop,
@@ -144,15 +134,9 @@ export interface SeatRefusal {
     | "invalid_effort"
     | "effort_unsupported_runtime"
     | "effort_unavailable"
-    | "invalid_policy"
-    | "selection_changed"
-    | "invalid_review"
-    | "checked_contract_unavailable"
-    | "stop_outcome_uncertain";
+    | "invalid_policy";
   message: string;
   guidance?: string;
-  current?: SeatReviewDescriptor | null;
-  partialStopEffect?: boolean;
   matches?: Array<{ rig_name: string; logical_id: string; current_occupant: string | null }>;
 }
 
@@ -183,7 +167,7 @@ interface SetCwdInput {
 }
 
 export type SetPolicyResult =
-  | { ok: true; seat: SeatDescriptor; from: string | null; to: string; launchPosture: "floor" | "full_bypass" | "auto"; changed: boolean; effect: string; review?: SeatReview }
+  | { ok: true; seat: SeatDescriptor; from: string | null; to: string; launchPosture: "floor" | "full_bypass" | "auto"; changed: boolean; effect: string }
   | SeatRefusal;
 
 /** OPR.0.7.0.7 — the four effort values for one seat, kept apart. */
@@ -229,7 +213,7 @@ export type SetEffortResult =
   | SeatRefusal;
 
 export type StopSeatResult =
-  | { ok: true; seat: SeatDescriptor; sessionName: string; sessionId: string; review?: SeatReview }
+  | { ok: true; seat: SeatDescriptor; sessionName: string; sessionId: string }
   | SeatRefusal;
 
 export type CleanSeatResult =
@@ -320,53 +304,6 @@ export class SeatLifecycleService {
     this.inPlaceRestartDaemonStartedAt = deps.inPlaceRestartDaemonStartedAt;
     this.transcripts = deps.transcripts ?? null;
     this.piRecords = deps.piRecords ?? null;
-  }
-
-  /**
-   * Resolve one seat and return its persisted review token plus a best-effort live probe.
-   * A thrown probe error is represented as unverified; it does not invalidate the DB snapshot.
-   */
-  async reviewSeat(seatRef: string): Promise<SeatReviewDescriptor | SeatRefusal> {
-    const resolved = this.resolveSeat(seatRef);
-    if ("code" in resolved) return resolved;
-    const descriptor = readSeatReview(this.db, resolved.nodeId);
-    if (!descriptor) return { ok: false, code: "seat_not_found", message: "The seat no longer exists." };
-    const session = this.latestSession(resolved.nodeId);
-    if ((session?.id ?? null) !== descriptor.review.latestSessionId) {
-      descriptor.liveState = { sessionStatus: descriptor.liveState.sessionStatus, observation: "unverified",
-        detail: "The latest session changed during review; fetch a fresh review." };
-      return descriptor;
-    }
-    if (session) {
-      try {
-        const probe = await this.tmuxAdapter.probeSession(session.session_name);
-        descriptor.liveState = { sessionStatus: descriptor.liveState.sessionStatus, observation: probe.state };
-      } catch (error) {
-        descriptor.liveState = { sessionStatus: descriptor.liveState.sessionStatus, observation: "unverified", detail: (error as Error).message };
-      }
-    }
-    return descriptor;
-  }
-
-  private checkedCurrent(seatRef: string, expected: SeatReview): SeatReviewDescriptor | SeatRefusal {
-    const resolved = this.resolveSeat(seatRef);
-    const current = "code" in resolved ? null : readSeatReview(this.db, resolved.nodeId);
-    if (!current || !sameSeatReview(expected, current.review)) {
-      return { ok: false, code: "selection_changed", message: "The seat or native history changed since review; refresh before retrying.", current };
-    }
-    return current;
-  }
-
-  private changedWhileWaiting(seatRef: string): SeatRefusal {
-    const resolved = this.resolveSeat(seatRef);
-    return { ok: false, code: "selection_changed", message: "The seat target changed while waiting; no change was made.",
-      current: "code" in resolved ? null : readSeatReview(this.db, resolved.nodeId) };
-  }
-
-  /** Refresh state after a stop may have had an external effect, falling back to persisted state. */
-  private async refreshedAfterStop(seatRef: string, nodeId: string): Promise<SeatReviewDescriptor | null> {
-    const observed = await this.reviewSeat(seatRef);
-    return "code" in observed ? readSeatReview(this.db, nodeId) : observed;
   }
 
   async setModel(input: { seatRef: string; model: string; reason: string; operator?: string | null }): Promise<SetModelResult> {
@@ -738,34 +675,16 @@ export class SeatLifecycleService {
     return probe.state === "present" ? { state: "yes" } : { state: "no", detail: "tmux session absent" };
   }
 
-  /**
-   * Save a seat's native permission choice for future managed launches. When expected
-   * is supplied, custody and the write transaction recheck the reviewed revision.
-   */
-  async setPermissions(input: { seatRef: string; mode: string; reason: string; actor: string; expected?: SeatReview }): Promise<
-    | { ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string; review?: SeatReview }
+  async setPermissions(input: { seatRef: string; mode: string; reason: string; actor: string }): Promise<
+    | { ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string }
     | SeatRefusal
   > {
     input = { ...input };
-    if (input.expected !== undefined && !validSeatReview(input.expected)) return { ok: false, code: "invalid_review", message: "Invalid seat review token." };
     const required = this.requireReason(input.reason);
     if (required) return required;
     if (!input.actor.trim()) return { ok: false, code: "permission_selection_refused", message: "Sender identity is required for permission audit." };
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
-    const guard = this.tmuxAdapter.deliveryGuard;
-    if (input.expected && !guard) return { ok: false, code: "checked_contract_unavailable", message: "Checked seat changes require the delivery guard." };
-    if (input.expected && guard && !guard.ownsCustody(resolved.nodeId)) {
-      try { return await guard.custody([resolved.nodeId], () => this.setPermissions(input)); }
-      catch (error) {
-        if (input.expected && error instanceof DeliveryGuardError && error.code === "guard_target_changed") return this.changedWhileWaiting(input.seatRef);
-        throw error;
-      }
-    }
-    if (input.expected) {
-      const current = this.checkedCurrent(input.seatRef, input.expected);
-      if ("code" in current) return current;
-    }
     const seat = this.describe(resolved);
     const runtime = resolved.entry.runtime ?? "unknown";
     try {
@@ -778,10 +697,6 @@ export class SeatLifecycleService {
       const store = new NativePermissionStore(this.db);
       let persisted: PersistedEvent | null = null;
       const result = this.db.transaction(() => {
-        if (input.expected) {
-          const current = this.checkedCurrent(input.seatRef, input.expected);
-          if ("code" in current) throw new SeatSelectionChanged(current);
-        }
         launch?.assertCurrent();
         const currentRuntime = this.db.prepare("SELECT runtime FROM nodes WHERE id = ?").get(seat.nodeId) as { runtime: string } | undefined;
         if (currentRuntime?.runtime !== runtime) throw new Error("Seat runtime changed while checking native options; selection was not changed.");
@@ -795,13 +710,11 @@ export class SeatLifecycleService {
             nodeId: seat.nodeId, from, to, actor: input.actor.trim(), reason: input.reason.trim(), source: "seat_selection", effect: "future_launches_only" });
         }
         return { ok: true as const, seat, from, to, changed,
-          ...(input.expected ? { review: readSeatReview(this.db, seat.nodeId)!.review } : {}),
           effect: "Future managed launches only. The current native process, history, permission rules and work posture are unchanged; no relaunch was requested." };
       })();
       if (persisted) this.eventBus.notifySubscribers(persisted);
       return result;
     } catch (error) {
-      if (error instanceof SeatSelectionChanged) return error.refusal;
       return { ok: false, code: "permission_selection_refused", message: (error as Error).message };
     }
   }
@@ -810,10 +723,8 @@ export class SeatLifecycleService {
    *  the raw ref and the provenance the instantiator would persist for the same member ref; restore,
    *  resume and launches that read the seat's stored state use that provenance, while a launch from a
    *  spec that declares a policy re-applies the spec's. The ref is validated exactly as a spec
-   *  member's is; the running process is untouched. If a review token is supplied, it is checked
-   *  while acquiring custody and again in the transaction that records the audited selection. */
-  async setPolicy(input: { seatRef: string; ref: string; reason: string; actor: string; expected?: SeatReview }): Promise<SetPolicyResult> {
-    if (input.expected !== undefined && !validSeatReview(input.expected)) return { ok: false, code: "invalid_review", message: "Invalid seat review token." };
+   *  member's is; the running process is untouched. */
+  async setPolicy(input: { seatRef: string; ref: string; reason: string; actor: string }): Promise<SetPolicyResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     const invalid = validatePermissionPolicyRef(input.ref, "permission_policy");
@@ -830,92 +741,53 @@ export class SeatLifecycleService {
     }
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
-    const guard = this.tmuxAdapter.deliveryGuard;
-    if (input.expected && !guard) return { ok: false, code: "checked_contract_unavailable", message: "Checked seat changes require the delivery guard." };
-    if (input.expected && guard && !guard.ownsCustody(resolved.nodeId)) {
-      try { return await guard.custody([resolved.nodeId], () => this.setPolicy(input)); }
-      catch (error) {
-        if (input.expected && error instanceof DeliveryGuardError && error.code === "guard_target_changed") return this.changedWhileWaiting(input.seatRef);
-        throw error;
-      }
-    }
-    if (input.expected) {
-      const current = this.checkedCurrent(input.seatRef, input.expected);
-      if ("code" in current) return current;
-    }
     const seat = this.describe(resolved);
     if (resolved.entry.runtime === "terminal") {
       return { ok: false, code: "invalid_policy", message: "permission_policy: not valid on terminal members (a terminal node is not an agent seat)" };
     }
 
+    const row = this.db.prepare("SELECT permission_policy FROM nodes WHERE id = ?").get(seat.nodeId) as { permission_policy: string | null } | undefined;
+    const from = row?.permission_policy ?? null;
     const provenance = {
       origin: attachment.origin,
       resolvedTarget: attachment.resolvedTarget ?? null,
       declaringDir: attachment.declaringDir ?? null,
       launchPosture: attachment.launchPosture,
     };
-    let persisted: PersistedEvent | null = null;
-    let from: string | null = null;
-    let changed = false;
-    let review: SeatReview | undefined;
-    let selection = false;
-    try {
+    const before = this.rigRepo.getNodePolicyProvenance(seat.nodeId);
+    const changed = from !== ref || !before || before.origin !== provenance.origin || before.resolvedTarget !== provenance.resolvedTarget
+      || before.declaringDir !== provenance.declaringDir || before.launchPosture !== provenance.launchPosture;
+    // Reaffirming the same Codex policy is also a deliberate choice for the next rebuild.
+    if (changed || resolved.entry.runtime === "codex") {
+      let persisted: PersistedEvent | null = null;
       this.db.transaction(() => {
-        if (input.expected) {
-          const current = this.checkedCurrent(input.seatRef, input.expected);
-          if ("code" in current) throw new SeatSelectionChanged(current);
-        }
-        const row = this.db.prepare("SELECT permission_policy FROM nodes WHERE id = ?").get(seat.nodeId) as { permission_policy: string | null } | undefined;
-        from = row?.permission_policy ?? null;
-        const before = this.rigRepo.getNodePolicyProvenance(seat.nodeId);
-        changed = from !== ref || !before || before.origin !== provenance.origin || before.resolvedTarget !== provenance.resolvedTarget
-          || before.declaringDir !== provenance.declaringDir || before.launchPosture !== provenance.launchPosture;
-        // Reaffirming the same Codex policy is also a deliberate choice for the next rebuild.
-        if (changed || resolved.entry.runtime === "codex") {
-          this.rigRepo.setNodePermissionPolicy(seat.nodeId, ref);
-          this.rigRepo.setNodePolicyProvenance(seat.nodeId, provenance);
-          persisted = this.eventBus.persistWithinTransaction({
-            type: "node.policy_changed", rigId: seat.rigId, nodeId: seat.nodeId, logicalId: seat.logicalId,
-            from, to: ref, launchPosture: attachment.launchPosture, reason: input.reason.trim(), operator: input.actor.trim(),
-          });
-        }
-        try { selection = new NativePermissionStore(this.db).read(seat.nodeId) !== null; } catch { /* launch reports invalid selection */ }
-        if (input.expected) review = readSeatReview(this.db, seat.nodeId)!.review;
+        this.rigRepo.setNodePermissionPolicy(seat.nodeId, ref);
+        this.rigRepo.setNodePolicyProvenance(seat.nodeId, provenance);
+        persisted = this.eventBus.persistWithinTransaction({
+          type: "node.policy_changed", rigId: seat.rigId, nodeId: seat.nodeId, logicalId: seat.logicalId,
+          from, to: ref, launchPosture: attachment.launchPosture, reason: input.reason.trim(), operator: input.actor.trim(),
+        });
       })();
-    } catch (error) {
-      if (error instanceof SeatSelectionChanged) return error.refusal;
-      throw error;
+      if (persisted) this.eventBus.notifySubscribers(persisted);
     }
-    if (persisted) this.eventBus.notifySubscribers(persisted);
+    let selection = false;
+    // An unreadable selection refuses the launch by itself (NativePermissionStore.read); nothing to add here.
+    try { selection = new NativePermissionStore(this.db).read(seat.nodeId) !== null; } catch { /* see above */ }
     const effect = "Restore, resume and launches that read this seat's stored state use this policy, unless an explicit native selection (rig seat set-permissions) takes precedence. "
       + "`rig up <rig name>` uses it; a launch from a spec that declares a policy replaces it with the spec's policy, which later restores then use. "
       + "The running process and the rig spec file are unchanged; nothing was restarted."
       + (selection ? " This seat has an explicit native permission selection, so that selection takes precedence at launch." : "");
-    return { ok: true, seat, from, to: ref, launchPosture: attachment.launchPosture, changed, effect, ...(review ? { review } : {}) };
+    return { ok: true, seat, from, to: ref, launchPosture: attachment.launchPosture, changed, effect };
   }
 
-  /**
-   * Stop a managed session, optionally conditioned on a prior review. Checked stops
-   * revalidate before destructive tmux commands and report uncertain or partial effects.
-   */
-  async stopSeat(input: { seatRef: string; reason: string; operator?: string | null; expected?: SeatReview }): Promise<StopSeatResult> {
-    if (input.expected !== undefined && !validSeatReview(input.expected)) return { ok: false, code: "invalid_review", message: "Invalid seat review token." };
+  async stopSeat(input: { seatRef: string; reason: string; operator?: string | null }): Promise<StopSeatResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
     const guard = this.tmuxAdapter.deliveryGuard;
-    if (input.expected && !guard) return { ok: false, code: "checked_contract_unavailable", message: "Checked stop requires the delivery guard." };
     if (guard && !guard.ownsLifecycle(resolved.nodeId)) {
-      try { return await guard.lifecycle([resolved.nodeId], () => this.stopSeat(input)); }
-      catch (error) {
-        if (input.expected && error instanceof DeliveryGuardError && error.code === "guard_target_changed") return this.changedWhileWaiting(input.seatRef);
-        throw error;
-      }
-    }
-    if (input.expected) {
-      const current = this.checkedCurrent(input.seatRef, input.expected);
-      if ("code" in current) return current;
+      return guard.lifecycle([resolved.nodeId], () => this.stopSeat(input));
     }
     const seat = this.describe(resolved);
 
@@ -937,10 +809,6 @@ export class SeatLifecycleService {
     // (KI-5.3-8 fabricated-absence class, destructive direction).
     const probed = await this.probeLiveness(session.session_name, "stop refuses rather than kill blind");
     if ("code" in probed) return probed;
-    if (input.expected) {
-      const current = this.checkedCurrent(input.seatRef, input.expected);
-      if ("code" in current) return current;
-    }
     if (probed.state === "absent") {
       return {
         ok: false,
@@ -950,7 +818,7 @@ export class SeatLifecycleService {
       };
     }
 
-    return this.stopManagedTmuxSeat(resolved, session, input.reason, input.operator, true, input.expected, input.seatRef);
+    return this.stopManagedTmuxSeat(resolved, session, input.reason, input.operator, true);
   }
 
   async cleanSeat(input: { seatRef: string; reason: string; operator?: string | null }): Promise<CleanSeatResult> {
@@ -1707,48 +1575,18 @@ export class SeatLifecycleService {
     reason: string,
     operator: string | null | undefined,
     recordStopIntent: boolean,
-    expected?: SeatReview,
-    seatRef?: string,
   ): Promise<StopSeatResult> {
     const seat = this.describe(resolved);
-    let kill: Awaited<ReturnType<TmuxAdapter["killSession"]>>;
-    try {
-      kill = expected
-        ? await this.tmuxAdapter.killSession(session.session_name, afterDetach => {
-          const current = this.checkedCurrent(seatRef!, expected);
-          if ("code" in current) throw new ReviewedStopChanged(current.current ?? null, afterDetach);
-        })
-        : await this.tmuxAdapter.killSession(session.session_name);
-    } catch (error) {
-      if (error instanceof ReviewedStopChanged) return { ok: false, code: "selection_changed",
-        message: error.afterDetach ? "The seat changed after detach; stop may have a partial external effect. Refresh its live state." : "The seat changed before stop; no stop effect was issued.",
-        current: error.afterDetach ? await this.refreshedAfterStop(seatRef!, seat.nodeId) : error.current,
-        ...(error.afterDetach ? { partialStopEffect: true } : {}) };
-      throw error;
-    }
+    const kill = await this.tmuxAdapter.killSession(session.session_name);
     if (kill && !kill.ok && kill.code !== "session_not_found") {
-      if (expected && !kill.afterDetach) {
-        const current = this.checkedCurrent(seatRef!, expected);
-        if ("code" in current) return current;
-      }
       return {
         ok: false,
-        code: expected && kill.afterDetach ? "stop_outcome_uncertain" : "tmux_probe_failed",
+        code: "tmux_probe_failed",
         message: `tmux kill-session for "${session.session_name}" failed: ${kill.message ?? kill.code}`,
-        ...(expected ? { partialStopEffect: !!kill.afterDetach, current: kill.afterDetach
-          ? await this.refreshedAfterStop(seatRef!, seat.nodeId) : readSeatReview(this.db, seat.nodeId) } : {}),
       };
     }
-    if (expected && !kill?.ok) return { ok: false, code: "stop_outcome_uncertain",
-      message: "The session disappeared during stop; the stop outcome is uncertain. Refresh native state.",
-      current: await this.refreshedAfterStop(seatRef!, seat.nodeId), partialStopEffect: true };
     let persisted: PersistedEvent | null = null;
-    let committedReview: SeatReview | undefined;
     const tx = this.db.transaction(() => {
-      if (expected) {
-        const current = this.checkedCurrent(seatRef!, expected);
-        if ("code" in current) throw new SeatSelectionChanged(current);
-      }
       if (recordStopIntent && kill?.ok) {
         this.sessionRegistry.markIntentionallyStopped(session.id);
       } else {
@@ -1764,19 +1602,11 @@ export class SeatLifecycleService {
         reason: reason.trim(),
         operator: operator ?? null,
       });
-      if (expected) committedReview = readSeatReview(this.db, seat.nodeId)!.review;
     });
-    try { tx(); }
-    catch (error) {
-      if (!expected) throw error;
-      return { ok: false, code: "stop_outcome_uncertain",
-        message: `The terminal stop may have completed, but its database status could not be saved: ${(error as Error).message}`,
-        current: await this.refreshedAfterStop(seatRef!, seat.nodeId), partialStopEffect: true };
-    }
+    tx();
     this.tmuxAdapter.deliveryGuard?.rebindLifecycle(resolved.nodeId);
     if (persisted) this.eventBus.notifySubscribers(persisted);
-    return { ok: true, seat, sessionName: session.session_name, sessionId: session.id,
-      ...(committedReview ? { review: committedReview } : {}) };
+    return { ok: true, seat, sessionName: session.session_name, sessionId: session.id };
   }
 
   private nonTerminalSessions(nodeId: string): LatestSessionRow[] {

@@ -21,23 +21,8 @@ import { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { transportSenderSession } from "./require-sender-identity.js";
 import type { SessionTransport } from "../domain/session-transport.js";
 import { DeliveryGuardError } from "../domain/seat-delivery-guard.js";
-import { validSeatReview, type SeatReview } from "../domain/seat-review.js";
 
 export const seatRoutes = new Hono();
-
-/** Distinguish an omitted check from a supplied malformed token at the HTTP boundary. */
-function expectedFromBody(body: Record<string, unknown>): { expected?: SeatReview; invalid?: boolean } {
-  if (!Object.hasOwn(body, "expected")) return {};
-  return validSeatReview(body.expected) ? { expected: body.expected } : { invalid: true };
-}
-
-seatRoutes.get("/capabilities", c => c.json({ contract: "seat-review.v1", features: ["seat-review.v1"],
-  checkedActions: ["stop", "set-permissions", "set-policy"] }));
-
-seatRoutes.get("/review/:seatRef", async c => {
-  const result = await seatLifecycleService(c).reviewSeat(c.req.param("seatRef"));
-  return "code" in result ? c.json(result, seatLifecycleStatus(result.code)) : c.json(result);
-});
 
 // S09 is an independent delivery preference, never a lifecycle or permission change.
 seatRoutes.post("/set-typing-guard/:seatRef", async c => {
@@ -275,14 +260,12 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
   });
 }
 
-/** Map checked-change refusals and uncertain stop outcomes to their public HTTP status. */
 function seatLifecycleStatus(code: string): 400 | 404 | 409 | 500 | 502 {
   if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "fresh_required"
     || code === "missing_effort" || code === "invalid_effort" || code === "invalid_policy"
-    || code === "missing_cwd" || code === "invalid_cwd" || code === "invalid_review") return 400;
+    || code === "missing_cwd" || code === "invalid_cwd") return 400;
   if (code === "seat_not_found") return 404;
-  if (code === "checked_contract_unavailable") return 500;
-  if (code === "tmux_probe_failed" || code === "stop_outcome_uncertain") return 502;
+  if (code === "tmux_probe_failed") return 502;
   if (code === "launch_unavailable" || code === "runtime_adapter_missing" || code === "launch_failed" || code === "startup_failed"
     || code === "effort_unavailable" || code === "cwd_check_failed" || code === "cwd_persistence_failed") return 500;
   // seat_ambiguous / session_live / session_not_live / no_session / claimed_session /
@@ -296,10 +279,8 @@ seatRoutes.post("/set-permissions/:seatRef", async (c) => {
   if (!actor) return c.json({ error: "Sender identity is required; pass --operator <address> when running outside a managed seat." }, 400);
   if (!body || Array.isArray(body) || typeof body.mode !== "string") return c.json({ error: "mode is required" }, 400);
   if (typeof body.reason !== "string") return c.json({ error: "reason is required" }, 400);
-  const selection = expectedFromBody(body);
-  if (selection.invalid) return c.json({ ok: false, code: "invalid_review", message: "expected must be a seat-review.v1 token" }, 400);
   const result = await seatLifecycleService(c).setPermissions({
-    seatRef: c.req.param("seatRef"), mode: body.mode, reason: body.reason, actor, ...selection,
+    seatRef: c.req.param("seatRef"), mode: body.mode, reason: body.reason, actor,
   });
   return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
 });
@@ -310,10 +291,8 @@ seatRoutes.post("/set-policy/:seatRef", async (c) => {
   const actor = transportSenderSession(c) ?? (typeof body?.operator === "string" ? body.operator.trim() : undefined);
   if (!actor) return c.json({ error: "Sender identity is required; pass --operator <address> when running outside a managed seat." }, 400);
   if (!body || Array.isArray(body) || typeof body.ref !== "string") return c.json({ error: "ref is required" }, 400);
-  const selection = expectedFromBody(body);
-  if (selection.invalid) return c.json({ ok: false, code: "invalid_review", message: "expected must be a seat-review.v1 token" }, 400);
   const result = await seatLifecycleService(c).setPolicy({
-    seatRef: c.req.param("seatRef"), ref: body.ref, reason: typeof body.reason === "string" ? body.reason : "", actor, ...selection,
+    seatRef: c.req.param("seatRef"), ref: body.ref, reason: typeof body.reason === "string" ? body.reason : "", actor,
   });
   return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
 });
@@ -421,13 +400,10 @@ seatRoutes.post("/continue/:seatRef", async (c) => {
 
 seatRoutes.post("/stop/:seatRef", async (c) => {
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
-  const selection = expectedFromBody(body);
-  if (selection.invalid) return c.json({ ok: false, code: "invalid_review", message: "expected must be a seat-review.v1 token" }, 400);
   const result = await seatLifecycleService(c).stopSeat({
     seatRef: c.req.param("seatRef")!,
     reason: typeof body["reason"] === "string" ? body["reason"] : "",
     operator: typeof body["operator"] === "string" ? body["operator"] : null,
-    ...selection,
   });
   if (result.ok) return c.json(result);
   return c.json(result, seatLifecycleStatus(result.code));

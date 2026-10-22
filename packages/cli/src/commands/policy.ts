@@ -47,7 +47,6 @@ import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl, daemonStatusGuard } from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
-import { readExpectedSeatReview } from "../seat-review-file.js";
 
 const HONESTY_PIN =
   "The team and kernel launch defaults pass allow/ask lists per launch and save none; a selected Claude settings fragment can merge native settings, rules included; the harness-native permissions are the control surface. " +
@@ -148,7 +147,7 @@ export function policyCommand(depsOverride?: StatusDeps): Command {
 async function applyToSeat(
   getDeps: () => StatusDeps,
   name: string,
-  opts: { seat: string; reason?: string; operator?: string; expectedFile?: string; json?: boolean },
+  opts: { seat: string; reason?: string; operator?: string; json?: boolean },
 ): Promise<void> {
   if (!(POLICY_CHOICES as readonly string[]).includes(name)) {
     const refusal = { ok: false, code: "invalid_policy", message: `Unknown policy choice '${name}'. Choose one of: ${POLICY_CHOICES.join(", ")}.` };
@@ -162,9 +161,8 @@ async function applyToSeat(
   if (!daemonStatusGuard(daemon)) return;
   const client = deps.clientFactory(getDaemonUrl(daemon));
   const ref = refFor(name);
-  const expected = await readExpectedSeatReview(opts.expectedFile);
   const res = await client.post<Record<string, unknown>>(`/api/seat/set-policy/${encodeURIComponent(opts.seat)}`, {
-    ref, reason: opts.reason ?? "", ...(opts.operator ? { operator: opts.operator } : {}), ...(expected ? { expected } : {}),
+    ref, reason: opts.reason ?? "", ...(opts.operator ? { operator: opts.operator } : {}),
   });
   if (opts.json) console.log(JSON.stringify(res.data));
   else if (res.status >= 400) {
@@ -181,7 +179,6 @@ async function applyToSeat(
   if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
 }
 
-/** Register native policy commands and the seat-only review-file option on either CLI path. */
 function registerPermissionCommands(cmd: Command, getDeps: () => StatusDeps): void {
 
   cmd
@@ -366,16 +363,10 @@ function registerPermissionCommands(cmd: Command, getDeps: () => StatusDeps): vo
     .option("--seat <seat>", "An existing seat (canonical session name or logical seat ref). `none` is an explicit floor for that seat and does not inherit the rig's policy. The running process and the spec file are unchanged. Afterwards a `rig launch --retry-startup-from` file has to carry the new policy")
     .option("--reason <text>", "With --seat: the audit reason (required)")
     .option("--operator <address>", "With --seat: operator recorded on the audit event when no session identity is present")
-    .option("--expected-file <path>", "With --seat: JSON from rig seat review; refuse if the seat changed")
     .option("--json", "Machine-readable output")
-    .action(async (name: string, opts: { spec?: string; seat?: string; reason?: string; operator?: string; expectedFile?: string; json?: boolean }) => {
+    .action(async (name: string, opts: { spec?: string; seat?: string; reason?: string; operator?: string; json?: boolean }) => {
       if ((opts.spec === undefined) === (opts.seat === undefined)) {
         console.error("Pass exactly one of --spec <path> (record into a rig spec) or --seat <seat> (record on an existing seat).");
-        process.exitCode = 1;
-        return;
-      }
-      if (opts.spec !== undefined && opts.expectedFile !== undefined) {
-        console.error("--expected-file applies only with --seat.");
         process.exitCode = 1;
         return;
       }

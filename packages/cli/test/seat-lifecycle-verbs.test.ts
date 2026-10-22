@@ -7,9 +7,6 @@ import { seatCommand } from "../src/commands/seat.js";
 import { DaemonTimeoutError } from "../src/client.js";
 import { STATE_FILE, type DaemonState, type LifecycleDeps } from "../src/daemon-lifecycle.js";
 import type { StatusDeps } from "../src/commands/status.js";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 function mockLifecycleDeps(): LifecycleDeps {
   return {
@@ -75,28 +72,6 @@ async function captureLogs(fn: () => Promise<void>): Promise<{ logs: string[]; e
 
 afterEach(() => {
   vi.restoreAllMocks();
-});
-
-describe("checked seat review CLI", () => {
-  it("reads the public review and passes a saved review token to stop", async () => {
-    const calls: Array<{ path: string; body: unknown }> = [];
-    const review = { contract: "seat-review.v1", rigId: "rig", nodeId: "node", revision: "a".repeat(64), latestSessionId: null, history: null };
-    await captureLogs(() => makeCommand(makeDeps({ status: 200, data: { review } }, calls)).parseAsync([
-      "node", "rig", "seat", "review", "dev@fixture", "--json",
-    ]));
-    expect(calls).toEqual([{ path: "/api/seat/review/dev%40fixture", body: undefined }]);
-    const dir = mkdtempSync(join(tmpdir(), "seat-review-"));
-    const file = join(dir, "review.json");
-    try {
-      writeFileSync(file, JSON.stringify({ review }));
-      calls.length = 0;
-      await captureLogs(() => makeCommand(makeDeps({ status: 200, data: { sessionName: "dev@fixture", seat: { logicalId: "dev", rigName: "fixture" } } }, calls)).parseAsync([
-        "node", "rig", "seat", "stop", "dev@fixture", "--reason", "test", "--expected-file", file,
-      ]));
-      expect(calls[0]).toEqual({ path: "/api/seat/stop/dev%40fixture",
-        body: { reason: "test", operator: undefined, expected: review } });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
 });
 
 describe("#729 startup warnings", () => {

@@ -1,7 +1,6 @@
 import type { PodRigInstantiator, AddMemberOutcome } from "./rigspec-instantiator.js";
 import type { ClaimService, ReconcileSessionOutcome } from "./claim-service.js";
 import type { SeatSkillPaths } from "./seat-skill-storage.js";
-import type { OperationContext } from "./operation-service.js";
 import type { RigRepository } from "./rig-repository.js";
 import { addRigEdge, removeRigEdge, type EdgeOpOutcome } from "./rig-edge-ops.js";
 
@@ -139,14 +138,13 @@ export async function convergeOp(
   rigId: string,
   op: TopologyOp,
   rigRoot: string,
-  opts?: { cwdOverride?: string; launchAdditionsFrom?: SeatSkillPaths; operation?: OperationContext },
+  opts?: { cwdOverride?: string; launchAdditionsFrom?: SeatSkillPaths },
 ): Promise<ConvergeResult> {
   switch (op.kind) {
     case "add_member": {
       const outcome = await deps.instantiator.addMemberToPod(rigId, op.pod, op.member, rigRoot, {
         cwdOverride: opts?.cwdOverride,
         ...(opts?.launchAdditionsFrom ? { launchAdditionsFrom: opts.launchAdditionsFrom } : {}),
-        ...(opts?.operation ? { operation: opts.operation } : {}),
         edges: op.edges,
       });
       return { kind: "add_member", supported: true, outcome };

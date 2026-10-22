@@ -38,10 +38,6 @@ import type { Pod, ExpansionPodFragment, RestoreOutcome, Snapshot } from "../dom
 import type { RigExpansionService } from "../domain/rig-expansion-service.js";
 import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
 import { convergeOp } from "../domain/topology-converge.js";
-import { completeOperationHttp, operationFailureHttp, operationHttp, operationId, operationService, reservationHttp } from "./operations.js";
-import { normalizedOperationRoot } from "../domain/operation-service.js";
-import { operationValidationFields } from "../domain/operation-public-result.js";
-import { runOperationMutation } from "../domain/operation-mutation-lane.js";
 import type { EdgeOpOutcome } from "../domain/rig-edge-ops.js";
 import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
 import type { SelfAttachService } from "../domain/self-attach-service.js";
@@ -327,29 +323,6 @@ rigsRoutes.post("/", async (c) => {
   const name = body["name"];
   if (!name || typeof name !== "string") {
     return c.json({ error: "name is required" }, 400);
-  }
-  const requestedId = operationId(c);
-  if (requestedId !== undefined) {
-    const operations = operationService(c);
-    let reservation;
-    try {
-      reservation = operations.reserve({ operationId: requestedId, kind: "rig.create",
-        targetIds: {}, payload: { name }, options: {} });
-    } catch { return c.json({ error: "invalid_operation_id" }, 400); }
-    const prior = reservationHttp(reservation);
-    if (prior) return prior;
-    let receipt;
-    try { receipt = operations.repository.db.transaction(() => {
-      const rig = getRepo(c).createRig(name);
-      const target = { rigId: rig.id, nodeIds: [] };
-      operations.commitEffectWithinTransaction({ operationId: requestedId, step: "rig",
-        kind: "topology.rig", targetId: rig.id, target, effect: "committed", phase: "created" });
-      operations.completeWithinTransaction({ operationId: requestedId, phase: "completed",
-        target, effect: "committed", external: "not_requested", httpStatus: 201, result: rig });
-      return operations.read(requestedId)!;
-    }).immediate(); }
-    catch { return operationFailureHttp(operations, requestedId); }
-    return operationHttp(receipt, 201);
   }
   const rig = getRepo(c).createRig(name);
   return c.json(rig, 201);
@@ -842,6 +815,9 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
   const rigId = c.req.param("rigId")!;
   const podNamespace = c.req.param("podNamespace")!;
   const podInstantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+  if (!podInstantiator) {
+    return c.json({ error: "Pod instantiator not available" }, 500);
+  }
 
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
   const member = body["member"];
@@ -862,53 +838,17 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
     ? (rawEdges as Array<{ from: string; to: string; kind: string }>)
     : undefined;
 
-  const requestedId = operationId(c);
-  const operations = requestedId === undefined ? undefined : operationService(c);
-  if (operations && requestedId !== undefined) {
-    let reservation;
-    try {
-      reservation = operations.reserve({ operationId: requestedId, kind: "member.add",
-        targetIds: { rigId, podNamespace }, payload: body,
-        options: { rigRoot: normalizedOperationRoot(rigRoot) }, expectsExternal: true });
-    } catch { return c.json({ error: "invalid_operation_request" }, 400); }
-    const prior = reservationHttp(reservation);
-    if (prior) return prior;
-  }
-  if (!podInstantiator) return c.json({ error: "Pod instantiator not available" }, 500);
-
-  const convergeWork = () => convergeOp(
+  const converged = await convergeOp(
     { instantiator: podInstantiator },
     rigId,
     { kind: "add_member", pod: podNamespace, member: member as Record<string, unknown>, edges },
     rigRoot,
-    operations && requestedId !== undefined ? { operation: { service: operations, operationId: requestedId } } : undefined,
   );
-  let converged;
-  try { converged = operations && requestedId !== undefined
-    ? await runOperationMutation(operations.repository.db, `rig:${rigId}`, convergeWork)
-    : await convergeWork(); }
-  catch (error) {
-    if (operations && requestedId !== undefined) return operationFailureHttp(operations, requestedId);
-    throw error;
-  }
   // This route is the add_member sugar over the converge interface.
   if (converged.kind !== "add_member" || !converged.supported) {
     return c.json({ error: "Unexpected converge result for add_member" }, 500);
   }
   const outcome = converged.outcome;
-
-  if (operations && requestedId !== undefined) {
-    const status = outcome.ok ? 201 : outcome.code === "rig_not_found" || outcome.code === "pod_not_found" ? 404
-      : outcome.code === "member_conflict" ? 409
-      : outcome.code === "edge_unresolved" || outcome.code === "validation_failed" || outcome.code === "preflight_failed" ? 400 : 500;
-    const result = outcome.ok
-      ? { ok: true, result: { podId: outcome.result.podId, podNamespace: outcome.result.podNamespace,
-        node: { logicalId: outcome.result.node.logicalId, nodeId: outcome.result.node.nodeId,
-          status: outcome.result.node.status }, edges: outcome.result.edges } }
-      : { ok: false, code: outcome.code, ...((outcome.code === "validation_failed" || outcome.code === "preflight_failed") && "errors" in outcome
-        ? { errors: operationValidationFields(outcome.errors) } : {}) };
-    return completeOperationHttp(operations, requestedId, status, result);
-  }
 
   if (!outcome.ok) {
     switch (outcome.code) {

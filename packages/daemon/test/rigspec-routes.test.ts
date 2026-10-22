@@ -1,5 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { randomUUID } from "node:crypto";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
 import type { Hono } from "hono";
 import type { RigRepository } from "../src/domain/rig-repository.js";
@@ -14,8 +13,6 @@ import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { createDaemon } from "../src/startup.js";
 import { RigSpecExporter as RigSpecExporterClass } from "../src/domain/rigspec-exporter.js";
 import { RigInstantiator } from "../src/domain/rigspec-instantiator.js";
-import { OperationRepository } from "../src/domain/operation-repository.js";
-import { OperationService, parseOperationYaml } from "../src/domain/operation-service.js";
 import { RigSpecPreflight } from "../src/domain/rigspec-preflight.js";
 import { RigRepository as RigRepoClass } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
@@ -220,20 +217,6 @@ describe("Rigspec import routes", () => {
       body: VALID_YAML,
     });
     expect(res.status).toBe(409);
-  });
-
-  it("saves a preflight 409 with bounded field guidance", async () => {
-    const setup = createTestApp(db);
-    setup.rigRepo.createRig("r99");
-    const id = randomUUID();
-    const res = await setup.app.request("/api/rigs/import", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain", "X-OpenRig-Operation-Id": id },
-      body: VALID_YAML,
-    });
-    expect(res.status).toBe(409);
-    expect(await res.json()).toMatchObject({ operation: { originalHttpStatus: 409 },
-      result: { code: "preflight_failed", errors: expect.any(Array) } });
   });
 
   it("POST /api/rigs/import/validate -> 200 + ValidationResult", async () => {
@@ -737,190 +720,6 @@ describe("Rigspec import routes (pod-aware dual-stack)", () => {
     const body = await res.json();
     expect(body.rigId).toBeDefined();
     expect(body.nodes).toEqual([{ logicalId: "research.scout", status: "materialized" }]);
-  });
-
-  it("materialize receipt returns committed IDs and replays without another topology", async () => {
-    const id = randomUUID();
-    const request = (source: string) => app.request("/api/rigs/import/materialize", { method: "POST",
-      headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
-      body: source });
-    const first = await request(MATERIALIZE_POD_YAML);
-    expect(first.status).toBe(201);
-    const created = await first.json();
-    expect(created.operation).toMatchObject({ operationId: id, state: "completed", effect: "committed",
-      target: { rigId: created.result.rigId } });
-    expect(created.operation.effects.map((item: { step: string }) => item.step))
-      .toEqual(expect.arrayContaining(["rig", "pod:research", "member:research.scout"]));
-    const replay = await request(MATERIALIZE_POD_YAML);
-    expect(replay.status).toBe(200);
-    expect(await replay.json()).toMatchObject({ replayed: true, result: { rigId: created.result.rigId } });
-    expect((await app.request(`/api/operations/${id}`)).status).toBe(200);
-    expect((await request(MATERIALIZE_POD_YAML.replace("live-topology", "another"))).status).toBe(409);
-    expect(db.prepare("SELECT COUNT(*) AS n FROM rigs WHERE name = 'live-topology'").get()).toEqual({ n: 1 });
-    rigRepo.deleteRig(created.result.rigId);
-    const afterDeletion = await request(MATERIALIZE_POD_YAML);
-    expect(afterDeletion.status).toBe(200);
-    expect(await afterDeletion.json()).toMatchObject({ replayed: true, result: { rigId: created.result.rigId } });
-    expect(db.prepare("SELECT COUNT(*) AS n FROM rigs WHERE name = 'live-topology'").get()).toEqual({ n: 0 });
-  });
-
-  it("createApp recovers a prior-boot receipt even with an injected operation service", async () => {
-    const isolatedDb = createFullTestDb();
-    try {
-      const id = randomUUID();
-      const prior = new OperationService(new OperationRepository(isolatedDb));
-      const request = { operationId: id, kind: "rig.import" as const, targetIds: {},
-        payload: parseOperationYaml(MATERIALIZE_POD_YAML), options: { rigRoot: "/tmp" }, expectsExternal: true };
-      expect(prior.reserve(request).kind).toBe("reserved");
-
-      const injected = new OperationService(new OperationRepository(isolatedDb));
-      const setup = createTestApp(isolatedDb, { appDeps: { operationService: injected } });
-      const instantiate = vi.spyOn(setup.podInstantiator, "instantiate");
-      const lookup = await setup.app.request(`/api/operations/${id}`);
-      expect(lookup.status).toBe(200);
-      expect(await lookup.json()).toMatchObject({ operation: { operationId: id, state: "interrupted",
-        recovery: { code: "new_operation_required" } } });
-
-      const retry = await setup.app.request("/api/rigs/import", { method: "POST",
-        headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
-        body: MATERIALIZE_POD_YAML });
-      expect(retry.status).toBe(200);
-      expect(await retry.json()).toMatchObject({ replayed: true,
-        operation: { operationId: id, state: "interrupted" } });
-      expect(instantiate).not.toHaveBeenCalled();
-      expect(isolatedDb.prepare("SELECT COUNT(*) AS n FROM rigs").get()).toEqual({ n: 0 });
-    } finally { isolatedDb.close(); }
-  });
-
-  it("createApp leaves this boot's injected in-flight receipt running", async () => {
-    const isolatedDb = createFullTestDb();
-    try {
-      const id = randomUUID();
-      const injected = new OperationService(new OperationRepository(isolatedDb));
-      const request = { operationId: id, kind: "rig.import" as const, targetIds: {},
-        payload: parseOperationYaml(MATERIALIZE_POD_YAML), options: { rigRoot: "/tmp" }, expectsExternal: true };
-      expect(injected.reserve(request).kind).toBe("reserved");
-
-      const setup = createTestApp(isolatedDb, { appDeps: { operationService: injected } });
-      const instantiate = vi.spyOn(setup.podInstantiator, "instantiate");
-      const lookup = await setup.app.request(`/api/operations/${id}`);
-      expect(await lookup.json()).toMatchObject({ operation: { operationId: id, state: "running" } });
-      const retry = await setup.app.request("/api/rigs/import", { method: "POST",
-        headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
-        body: MATERIALIZE_POD_YAML });
-      expect(retry.status).toBe(202);
-      expect(await retry.json()).toMatchObject({ operation: { operationId: id, state: "running" } });
-      expect(instantiate).not.toHaveBeenCalled();
-      expect(isolatedDb.prepare("SELECT COUNT(*) AS n FROM rigs").get()).toEqual({ n: 0 });
-    } finally { isolatedDb.close(); }
-  });
-
-  it("createApp rejects an injected service on another DB before recovery", () => {
-    const db1 = createFullTestDb();
-    const db2 = createFullTestDb();
-    try {
-      const wrongService = new OperationService(new OperationRepository(db2));
-      const recover = vi.spyOn(wrongService, "recoverInterrupted");
-      expect(() => createTestApp(db1, { appDeps: { operationService: wrongService } }))
-        .toThrow(/operationService.*same db handle/);
-      expect(recover).not.toHaveBeenCalled();
-    } finally { db1.close(); db2.close(); }
-  });
-
-  it("terminalizes a materialize result-write fault after committed topology", async () => {
-    const service = new OperationService(new OperationRepository(db));
-    vi.spyOn(service, "completeWithinTransaction").mockImplementationOnce(() => {
-      throw new Error("injected result write fault");
-    });
-    const routeApp = createTestApp(db, { appDeps: { operationService: service } }).app;
-    const id = randomUUID();
-    const request = () => routeApp.request("/api/rigs/import/materialize", { method: "POST",
-      headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
-      body: MATERIALIZE_POD_YAML });
-    const first = await request();
-    expect(first.status).toBe(500);
-    expect(await first.json()).toMatchObject({ operation: { state: "completed", effect: "committed",
-      originalHttpStatus: 500 }, result: { code: "operation_failed" } });
-    expect((await request()).status).toBe(200);
-    expect(db.prepare("SELECT COUNT(*) AS n FROM rigs WHERE name = 'live-topology'").get()).toEqual({ n: 1 });
-  });
-
-  it("pod import receipt records bootstrap units and replays the outcome", async () => {
-    const id = randomUUID();
-    const request = () => app.request("/api/rigs/import", { method: "POST",
-      headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
-      body: MATERIALIZE_POD_YAML });
-    const first = await request();
-    expect(first.status).toBe(201);
-    const body = await first.json();
-    expect(body.operation).toMatchObject({ operationId: id, state: "completed",
-      target: { rigId: body.result.rigId }, effect: "committed" });
-    expect(body.operation.effects.map((step: { step: string }) => step.step))
-      .toEqual(expect.arrayContaining(["rig", "pod:research", "member:research.scout", "launch:research.scout"]));
-    expect((await request()).status).toBe(200);
-    expect(db.prepare("SELECT COUNT(*) AS n FROM rigs WHERE name = 'live-topology'").get()).toEqual({ n: 1 });
-  });
-
-  it("saves a validation 400 with field guidance without retaining spec values", async () => {
-    const id = randomUUID();
-    const source = MATERIALIZE_POD_YAML.replace("name: live-topology",
-      "name: live-topology\nprivate_token: pg_secret_123");
-    const request = () => app.request("/api/rigs/import", { method: "POST",
-      headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
-      body: source });
-    const first = await request();
-    expect(first.status).toBe(400);
-    const body = await first.json();
-    expect(body.operation).toMatchObject({ state: "completed", effect: "none", originalHttpStatus: 400 });
-    expect(body.result).toEqual({ code: "validation_failed", errors: ["request: invalid"] });
-    expect(JSON.stringify(body)).not.toContain("pg_secret_123");
-    const replay = await request();
-    expect(replay.status).toBe(200);
-    expect(await replay.json()).toMatchObject({ replayed: true,
-      operation: { originalHttpStatus: 400 }, result: { code: "validation_failed" } });
-  });
-
-  it("terminalizes a same-boot import fault after an owned effect without re-execution", async () => {
-    const id = randomUUID();
-    let executions = 0;
-    const routeApp = createTestApp(db, { appDeps: { podInstantiator: {
-      db,
-      instantiate: async (_source: string, _root: string, opts: {
-        operation: { service: import("../src/domain/operation-service.js").OperationService; operationId: string };
-      }) => {
-        executions++;
-        db.transaction(() => {
-          const rig = rigRepo.createRig("injected-partial");
-          opts.operation.service.commitEffectWithinTransaction({ operationId: opts.operation.operationId,
-            step: "rig", kind: "topology.rig", targetId: rig.id,
-            target: { rigId: rig.id, nodeIds: [] }, effect: "committed", phase: "created" });
-        }).immediate();
-        throw new Error("injected member journal fault");
-      },
-    } as never } }).app;
-    const request = () => routeApp.request("/api/rigs/import", { method: "POST",
-      headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
-      body: MATERIALIZE_POD_YAML });
-    const first = await request();
-    expect(first.status).toBe(500);
-    expect(await first.json()).toMatchObject({ operation: { state: "completed", effect: "committed",
-      originalHttpStatus: 500 }, result: { code: "operation_failed" } });
-    const replay = await request();
-    expect(replay.status).toBe(200);
-    expect(await replay.json()).toMatchObject({ replayed: true, operation: { state: "completed",
-      effect: "committed" } });
-    expect(executions).toBe(1);
-    expect(rigRepo.listRigs().filter((rig) => rig.name === "injected-partial")).toHaveLength(1);
-  });
-
-  it("rejects empty operation IDs on import and materialize before topology changes", async () => {
-    for (const path of ["/api/rigs/import", "/api/rigs/import/materialize"]) {
-      const res = await app.request(path, { method: "POST",
-        headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": "" },
-        body: MATERIALIZE_POD_YAML });
-      expect(res.status).toBe(400);
-    }
-    expect(db.prepare("SELECT COUNT(*) AS n FROM rigs WHERE name = 'live-topology'").get()).toEqual({ n: 0 });
   });
 
   it("POST /api/rigs/import/materialize honors X-Cwd-Override", async () => {

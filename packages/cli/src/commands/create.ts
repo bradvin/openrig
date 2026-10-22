@@ -6,7 +6,6 @@ import { getDaemonStatus, getDaemonUrl, daemonStatusGuard } from "../daemon-life
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 import { resolveDefaultAgentRef } from "./topology-default-agent.js";
-import { malformedOperationResult, operationResult, requireOperationCapability, validOperationId } from "./operation.js";
 
 interface CreateResult {
   rigId: string;
@@ -19,12 +18,10 @@ interface CreateResult {
     error?: string;
   }>;
   errors?: string[];
-  code?: string;
   message?: string;
   error?: string;
 }
 
-/** Create a one-seat rig; an opted-in retry must prove daemon support and return its own receipt. */
 export function createCommand(depsOverride?: StatusDeps): Command {
   const cmd = new Command("create").description("Create a one-seat rig without writing a spec");
   const getDeps = () => depsOverride ?? {
@@ -37,15 +34,12 @@ export function createCommand(depsOverride?: StatusDeps): Command {
     .option("--runtime <runtime>", "Agent runtime", "claude-code")
     .option("--cwd <path>", "Working directory for the seat", process.cwd())
     .option("--json", "JSON output for agents")
-    .option("--operation-id <uuid>", "Durable retry identity for this create")
-    .action(async (name: string, opts: { runtime: string; cwd: string; json?: boolean; operationId?: string }) => {
-      if (!validOperationId(opts.operationId, opts.json)) return;
+    .action(async (name: string, opts: { runtime: string; cwd: string; json?: boolean }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
       if (!daemonStatusGuard(status)) return;
 
       const client = deps.clientFactory(getDaemonUrl(status));
-      if (opts.operationId !== undefined && !await requireOperationCapability(client, "rig.import")) return;
       let agentRef: string;
       try {
         agentRef = await resolveDefaultAgentRef(client, opts.runtime);
@@ -79,32 +73,17 @@ export function createCommand(depsOverride?: StatusDeps): Command {
         "/api/rigs/import",
         yaml,
         "text/yaml",
-        { "X-Rig-Root": cwd, "X-Cwd-Override": cwd,
-          ...(opts.operationId !== undefined ? { "X-OpenRig-Operation-Id": opts.operationId } : {}) },
+        { "X-Rig-Root": cwd, "X-Cwd-Override": cwd },
         { timeoutMs: 120_000 },
       );
-      const result = operationResult(res.data, res.status, opts.operationId, opts.json);
-      if (result === undefined) return;
-      res.data = result.value;
-      // Receipt payloads cross a network boundary despite the static response type.
-      if (opts.operationId !== undefined && result.status < 400 &&
-        (typeof res.data.rigId !== "string" || !Array.isArray(res.data.nodes)
-          || res.data.nodes.some((candidate) => !candidate || typeof candidate !== "object"
-            || typeof candidate.logicalId !== "string" || typeof candidate.status !== "string"))) {
-        malformedOperationResult(opts.operationId, opts.json);
-        return;
-      }
-      const node = Array.isArray(res.data.nodes)
-        ? res.data.nodes.find((candidate) => candidate && typeof candidate === "object" && candidate.logicalId === logicalId)
-        : undefined;
-      const ok = result.status < 400 && node?.status === "launched";
+      const node = res.data.nodes?.find((candidate) => candidate.logicalId === logicalId);
+      const ok = res.status < 400 && node?.status === "launched";
       // The same reason in both outputs, under the key `rig grow --json` uses.
-      const detail = ok ? undefined : ((Array.isArray(res.data.errors) ? res.data.errors.join("; ") : undefined)
+      const detail = ok ? undefined : (res.data.errors?.join("; ")
         ?? res.data.message
         ?? res.data.error
         ?? node?.error
-        ?? res.data.code
-        ?? `Create failed (HTTP ${result.status})`);
+        ?? `Create failed (HTTP ${res.status})`);
 
       if (opts.json) {
         console.log(JSON.stringify({
@@ -114,7 +93,6 @@ export function createCommand(depsOverride?: StatusDeps): Command {
           pod: "main",
           seat: logicalId,
           source: agentRef,
-          ...(opts.operationId !== undefined ? { operationId: opts.operationId } : {}),
           node,
           ...(detail !== undefined ? { detail } : {}),
         }, null, 2));

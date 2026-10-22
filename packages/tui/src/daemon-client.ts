@@ -138,22 +138,6 @@ export class DaemonClient {
     return parsed;
   }
 
-  /** Check support before opting a write into durable receipt semantics. */
-  operationCapabilities(): Promise<{ contract: "operations.v1"; kinds: import("@openrig/daemon/operation-surface").OperationKind[] }> {
-    return this.get("/api/operations/capabilities") as Promise<{
-      contract: "operations.v1";
-      kinds: import("@openrig/daemon/operation-surface").OperationKind[];
-    }>;
-  }
-
-  /** Read the persisted outcome after a write response was lost. No effect is retried. */
-  operation(operationId: string): Promise<{ operation: import("@openrig/daemon/operation-surface").OperationReceipt; result?: unknown }> {
-    return this.get(`/api/operations/${encodeURIComponent(operationId)}`) as Promise<{
-      operation: import("@openrig/daemon/operation-surface").OperationReceipt;
-      result?: unknown;
-    }>;
-  }
-
   /** Running daemon identity. `selfHostId` may be absent on an older daemon. */
   async configBrowser() {
     let res: Response;

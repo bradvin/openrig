@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { describe, it, expect, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -13,8 +13,6 @@ import { NodeLauncher } from "../src/domain/node-launcher.js";
 import { StartupOrchestrator } from "../src/domain/startup-orchestrator.js";
 import { reconcileSkillLoadout } from "../src/domain/skill-catalog.js";
 import { PodRigInstantiator } from "../src/domain/rigspec-instantiator.js";
-import { OperationRepository } from "../src/domain/operation-repository.js";
-import { OperationService } from "../src/domain/operation-service.js";
 import { BootstrapOrchestrator } from "../src/domain/bootstrap-orchestrator.js";
 import { ServiceOrchestrator } from "../src/domain/service-orchestrator.js";
 import { ComposeServicesAdapter } from "../src/adapters/compose-services-adapter.js";
@@ -109,140 +107,6 @@ describe("PodRigInstantiator", () => {
 
     return { db, rigRepo, podRepo, sessionRegistry, eventBus, inst, adapter, codexAdapter, tmux };
   }
-
-  it("aborts pod bootstrap if a pod journal write fails, with no unreceipted pod", async () => {
-    const { db, rigRepo, podRepo, inst } = setup();
-    const service = new OperationService(new OperationRepository(db));
-    const operationId = randomUUID();
-    service.reserve({ operationId, kind: "rig.import", targetIds: {},
-      payload: { name: "test-rig" }, options: { rigRoot: RIG_ROOT }, expectsExternal: true });
-    const original = service.commitEffectWithinTransaction.bind(service);
-    vi.spyOn(service, "commitEffectWithinTransaction").mockImplementation((effect) => {
-      if (effect.step === "pod:dev") throw new Error("injected journal fault");
-      original(effect);
-    });
-
-    await expect(inst.instantiate(RigSpecCodec.serialize(makeRigSpec()), RIG_ROOT,
-      { operation: { service, operationId } })).rejects.toThrow("operation_journal_failed");
-    const rig = rigRepo.listRigs()[0];
-    expect(rig).toBeDefined();
-    expect(podRepo.getPodByNamespace(rig!.id, "dev")).toBeNull();
-    expect(service.read(operationId)?.effects.map((step) => step.step)).toEqual(["rig"]);
-    db.close();
-  });
-
-  it("compensates only owned topology after a failed service boot", async () => {
-    const { db, rigRepo, inst } = setup();
-    const unrelated = rigRepo.createRig("unrelated");
-    const service = new OperationService(new OperationRepository(db));
-    const operationId = randomUUID();
-    service.reserve({ operationId, kind: "rig.import", targetIds: {},
-      payload: { name: "test-rig" }, options: { rigRoot: RIG_ROOT }, expectsExternal: true });
-
-    const outcome = await inst.instantiate(RigSpecCodec.serialize(makeRigSpec()), RIG_ROOT,
-      { operation: { service, operationId }, prelaunchHook: async () => ({
-        ok: false, code: "service_boot_failed", message: "fixture service refused boot",
-      }) });
-    expect(outcome).toMatchObject({ ok: false, code: "service_boot_failed" });
-    expect(rigRepo.listRigs().map((rig) => rig.id)).toEqual([unrelated.id]);
-    expect(service.read(operationId)).toMatchObject({ effect: "rolled_back", external: "incomplete" });
-    expect(service.read(operationId)?.effects.filter((effect) => effect.kind.startsWith("topology.")))
-      .toEqual(expect.arrayContaining([
-        expect.objectContaining({ step: "rig", state: "compensated" }),
-        expect.objectContaining({ step: "pod:dev", state: "compensated" }),
-      ]));
-    db.close();
-  });
-
-  it("rolls back a terminal member when required policy provenance cannot persist", async () => {
-    const { db, rigRepo, inst } = setup();
-    const service = new OperationService(new OperationRepository(db));
-    const operationId = randomUUID();
-    service.reserve({ operationId, kind: "rig.import", targetIds: {},
-      payload: { name: "test-rig" }, options: { rigRoot: RIG_ROOT }, expectsExternal: true });
-    const setProvenance = rigRepo.setNodePolicyProvenance.bind(rigRepo);
-    vi.spyOn(rigRepo, "setNodePolicyProvenance").mockImplementation((nodeId, provenance) => {
-      const node = db.prepare("SELECT logical_id FROM nodes WHERE id = ?").get(nodeId) as { logical_id: string };
-      if (node.logical_id === "dev.term") throw new Error("injected provenance fault");
-      setProvenance(nodeId, provenance);
-    });
-    const spec = makeRigSpec({ permissionPolicy: "builtin:locked", pods: [{ id: "dev", label: "Dev", members: [
-      { id: "term", agentRef: "builtin:terminal", profile: "none", runtime: "terminal",
-        cwd: "." },
-      { id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "claude-code", cwd: "." },
-    ], edges: [] }] });
-    const outcome = await inst.instantiate(RigSpecCodec.serialize(spec), RIG_ROOT,
-      { operation: { service, operationId } });
-    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
-    const rig = rigRepo.listRigs()[0]!;
-    expect(db.prepare("SELECT logical_id FROM nodes WHERE rig_id = ? ORDER BY logical_id").all(rig.id))
-      .toEqual([{ logical_id: "dev.impl" }]);
-    expect(service.read(operationId)?.effects.some((effect) => effect.step === "member:dev.term")).toBe(false);
-    expect(service.read(operationId)?.effects.some((effect) => effect.step === "member:dev.impl")).toBe(true);
-    db.close();
-  });
-
-  it("receipts target-rig settings without a new member and rolls back a provenance fault", async () => {
-    const { db, rigRepo, inst } = setup();
-    const target = rigRepo.createRig("test-rig");
-    const service = new OperationService(new OperationRepository(db));
-    const spec = RigSpecCodec.serialize(makeRigSpec({ pods: [{ id: "settings", label: "Settings",
-      members: [], edges: [] }], permissionPolicy: "builtin:locked" }));
-    const failedId = randomUUID();
-    service.reserve({ operationId: failedId, kind: "rig.materialize", targetIds: { rigId: target.id },
-      payload: { name: "test-rig" }, options: { rigRoot: RIG_ROOT } });
-    vi.spyOn(rigRepo, "setRigPolicyProvenance").mockImplementationOnce(() => {
-      throw new Error("injected provenance fault");
-    });
-    const failed = await inst.materialize(spec, RIG_ROOT, { targetRigId: target.id,
-      operation: { service, operationId: failedId } });
-    expect(failed.ok).toBe(false);
-    expect(rigRepo.getRigPermissionPolicy(target.id)).toBeNull();
-    expect(rigRepo.getRigPolicyProvenance(target.id)).toBeNull();
-    expect(service.read(failedId)?.effect).toBe("none");
-    expect(service.read(failedId)?.effects).toHaveLength(0);
-
-    vi.restoreAllMocks();
-    const acceptedId = randomUUID();
-    service.reserve({ operationId: acceptedId, kind: "rig.materialize", targetIds: { rigId: target.id },
-      payload: { name: "test-rig" }, options: { rigRoot: RIG_ROOT } });
-    const accepted = await inst.materialize(spec, RIG_ROOT, { targetRigId: target.id,
-      operation: { service, operationId: acceptedId } });
-    expect(accepted.ok, JSON.stringify(accepted)).toBe(true);
-    expect(rigRepo.getRigPermissionPolicy(target.id)).toBe("builtin:locked");
-    expect(service.read(acceptedId)).toMatchObject({ effect: "committed", target: { rigId: target.id, nodeIds: [] } });
-    expect(service.read(acceptedId)?.effects).toEqual(expect.arrayContaining([expect.objectContaining({
-      step: "config:target_rig", kind: "config.rig", targetId: target.id, state: "committed" })]));
-    db.close();
-  });
-
-  it("rolls back terminal node and session restore writes if the second write fails", async () => {
-    const { db, rigRepo, inst } = setup();
-    const service = new OperationService(new OperationRepository(db));
-    const operationId = randomUUID();
-    service.reserve({ operationId, kind: "rig.import", targetIds: {},
-      payload: { name: "test-rig" }, options: { rigRoot: RIG_ROOT }, expectsExternal: true });
-    const addNode = rigRepo.addNode.bind(rigRepo);
-    vi.spyOn(rigRepo, "addNode").mockImplementation((...args) => {
-      const node = addNode(...args);
-      db.prepare("UPDATE nodes SET restore_policy = 'resume_if_possible' WHERE id = ?").run(node.id);
-      return node;
-    });
-    db.exec(`CREATE TRIGGER fail_terminal_session_restore BEFORE UPDATE OF restore_policy ON sessions
-      WHEN NEW.restore_policy = 'checkpoint_only' BEGIN SELECT RAISE(ABORT, 'injected second write fault'); END;`);
-    const spec = makeRigSpec({ pods: [{ id: "dev", label: "Dev", members: [
-      { id: "term", agentRef: "builtin:terminal", profile: "none", runtime: "terminal", cwd: "." },
-    ], edges: [] }] });
-    await expect(inst.instantiate(RigSpecCodec.serialize(spec), RIG_ROOT,
-      { operation: { service, operationId } })).rejects.toThrow("injected second write fault");
-    const rig = rigRepo.listRigs()[0]!;
-    expect(db.prepare("SELECT restore_policy FROM nodes WHERE rig_id = ?").get(rig.id))
-      .toEqual({ restore_policy: "resume_if_possible" });
-    expect(service.read(operationId)?.effects.some((step) => step.step === "config:restore:dev.term")).toBe(false);
-    expect(service.read(operationId)?.effects.find((step) => step.step === "launch:dev.term"))
-      .toMatchObject({ state: "indeterminate" });
-    db.close();
-  });
 
   // T1: valid rig instantiates pods + nodes + edges
   it("instantiates pods + nodes correctly", async () => {

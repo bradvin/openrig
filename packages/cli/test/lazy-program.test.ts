@@ -21,13 +21,6 @@ describe("lazy-program", () => {
     expect([...COMMAND_LOADERS.keys()]).toEqual(full.commands.map((c) => c.name()));
   });
 
-  it("loads operation receipt lookup and its get subcommand through the public lazy path", async () => {
-    const program = await createLazyProgram("operation");
-    expect(program?.commands.map(command => command.name())).toEqual(["operation"]);
-    expect(program?.commands[0]?.commands.map(command => command.name())).toEqual(["get"]);
-    expect(program?.commands[0]?.helpInformation()).toContain("Inspect durable create");
-  });
-
   it("builds, for each name, the same command as createProgram", async () => {
     for (const expected of full.commands) {
       const program = await createLazyProgram(expected.name());

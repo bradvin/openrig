@@ -17,19 +17,6 @@ import { LegacyRigSpecSchema as RigSpecSchema } from "./rigspec-schema.js"; // T
 import { LegacyRigSpecCodec as RigSpecCodec } from "./rigspec-codec.js"; // TODO: AS-T08b — migrate to pod-aware RigSpec
 import type { LegacyRigSpec as RigSpec, LegacyRigSpecEdge as RigSpecEdge, InstantiateOutcome, InstantiateResult } from "./types.js"; // TODO: AS-T08b — migrate to pod-aware RigSpec
 import { resolveLaunchCwd } from "./cwd-resolution.js";
-import type { OperationContext } from "./operation-service.js";
-
-class OperationJournalFailure extends Error {
-  constructor(cause: unknown) {
-    super("operation_journal_failed", { cause });
-  }
-}
-
-/** Keep journal failures distinct so the caller cannot treat an unrecorded effect as recoverable success. */
-function recordOperationEffect(operation: OperationContext, input: Parameters<OperationContext["service"]["commitEffectWithinTransaction"]>[0]): void {
-  try { operation.service.commitEffectWithinTransaction(input); }
-  catch (error) { throw new OperationJournalFailure(error); }
-}
 
 // Only these edge kinds constrain launch order
 const LAUNCH_DEPENDENCY_KINDS = new Set(["delegates_to", "spawned_by"]);
@@ -79,8 +66,7 @@ export class RigInstantiator {
     this.tmuxAdapter = deps.tmuxAdapter;
   }
 
-  /** Journal legacy topology in its owning transaction and each launch before external execution. */
-  async instantiate(spec: RigSpec, opts?: { nonInterruptive?: boolean; env?: SeatEnv; operation?: OperationContext }): Promise<InstantiateOutcome> {
+  async instantiate(spec: RigSpec, opts?: { nonInterruptive?: boolean; env?: SeatEnv }): Promise<InstantiateOutcome> {
     // 1. Validate
     const raw = RigSpecCodec.parse(RigSpecCodec.serialize(spec));
     const validation = RigSpecSchema.validate(raw);
@@ -119,15 +105,11 @@ export class RigInstantiator {
     // 4. Atomic DB materialization: rig + nodes + edges
     let rigId: string;
     const nodeIdMap: Record<string, string> = {}; // logicalId -> DB id
-    const edgeIds: string[] = [];
     try {
       const txn = this.db.transaction(() => {
         const rig = this.rigRepo.createRig(spec.name);
         rigId = rig.id;
         if (opts?.nonInterruptive !== undefined) this.rigRepo.setRigNonInterruptive(rig.id, opts.nonInterruptive);
-        if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-          operationId: opts.operation.operationId, step: "rig", kind: "topology.rig", targetId: rig.id,
-          target: { rigId: rig.id, nodeIds: [] }, effect: "committed", phase: "materializing" });
 
         for (const specNode of spec.nodes) {
           const node = this.rigRepo.addNode(rig.id, specNode.id, {
@@ -143,24 +125,15 @@ export class RigInstantiator {
             packageRefs: specNode.packageRefs,
           });
           nodeIdMap[specNode.id] = node.id;
-          if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-            operationId: opts.operation.operationId, step: `member:${specNode.id}`, kind: "topology.member",
-            targetId: node.id, target: { rigId: rig.id, nodeIds: Object.values(nodeIdMap) },
-            effect: "committed", phase: "materializing" });
         }
 
         for (const specEdge of spec.edges) {
-          const edge = this.rigRepo.addEdge(
+          this.rigRepo.addEdge(
             rig.id,
             nodeIdMap[specEdge.from]!,
             nodeIdMap[specEdge.to]!,
             specEdge.kind
           );
-          edgeIds.push(edge.id);
-          if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-            operationId: opts.operation.operationId, step: `edge:${edge.id}`, kind: "topology.edge",
-            targetId: edge.id, target: { rigId: rig.id, nodeIds: Object.values(nodeIdMap) },
-            effect: "committed", phase: "materializing" });
         }
       });
       txn();
@@ -178,20 +151,7 @@ export class RigInstantiator {
     const instantiateWarnings: string[] = [];
 
     for (const logicalId of launchOrder) {
-      const operation = opts?.operation;
-      if (operation) operation.service.beginExternalStep({ operationId: operation.operationId,
-        step: `launch:${logicalId}`, kind: "external.launch", targetId: nodeIdMap[logicalId], phase: "launching" });
-      let result;
-      try {
-        result = await this.nodeLauncher.launchNode(rigId!, logicalId, opts?.env ? { env: opts.env } : undefined);
-      } catch (error) {
-        if (operation) operation.service.finishExternalStep({ operationId: operation.operationId,
-          step: `launch:${logicalId}`, state: "indeterminate", external: "indeterminate", phase: "launch_uncertain" });
-        throw error;
-      }
-      if (operation) operation.service.finishExternalStep({ operationId: operation.operationId,
-        step: `launch:${logicalId}`, state: "observed", external: result.ok ? "completed" : "incomplete",
-        phase: "launched" });
+      const result = await this.nodeLauncher.launchNode(rigId!, logicalId, opts?.env ? { env: opts.env } : undefined);
       if (result.ok) {
         nodeResults.push({ logicalId, status: "launched" });
         launchedSessionNames.push(result.sessionName);
@@ -208,32 +168,12 @@ export class RigInstantiator {
     if (allFailed && nodeResults.length > 0) {
       const cleanup = async () => {
         if (this.tmuxAdapter) {
-          for (const [index, sessionName] of launchedSessionNames.entries()) {
-            if (opts?.operation) opts.operation.service.beginExternalStep({ operationId: opts.operation.operationId,
-              step: `cleanup:${index}`, kind: "external.cleanup", targetId: rigId, phase: "cleaning" });
+          for (const sessionName of launchedSessionNames) {
             const stopped = await this.tmuxAdapter.killSession(sessionName);
-            if (opts?.operation) opts.operation.service.finishExternalStep({ operationId: opts.operation.operationId,
-              step: `cleanup:${index}`, state: "observed", external: stopped.ok ? "completed" : "incomplete",
-              phase: "cleaning" });
             if (!stopped.ok) return; // Preserve custody when termination was refused/unverified.
           }
         }
-        if (opts?.operation) this.db.transaction(() => {
-          this.rigRepo.deleteRig(rigId!);
-          for (const [logicalId, nodeId] of Object.entries(nodeIdMap)) {
-            opts.operation!.service.commitEffectWithinTransaction({ operationId: opts.operation!.operationId,
-              step: `member:${logicalId}`, kind: "topology.member", targetId: nodeId,
-              state: "compensated", target: { rigId, nodeIds: [] }, effect: "partial", phase: "compensating" });
-          }
-          for (const edgeId of edgeIds) opts.operation!.service.commitEffectWithinTransaction({
-            operationId: opts.operation!.operationId, step: `edge:${edgeId}`, kind: "topology.edge",
-            targetId: edgeId, state: "compensated", target: { rigId, nodeIds: [] },
-            effect: "partial", phase: "compensating" });
-          opts.operation!.service.commitEffectWithinTransaction({ operationId: opts.operation!.operationId,
-            step: "rig", kind: "topology.rig", targetId: rigId, state: "compensated",
-            target: { rigId, nodeIds: [] }, effect: "rolled_back", phase: "compensated" });
-        }).immediate();
-        else this.rigRepo.deleteRig(rigId!);
+        this.rigRepo.deleteRig(rigId!);
       };
       const guard = this.tmuxAdapter?.deliveryGuard;
       if (guard) await guard.lifecycle(Object.values(nodeIdMap), cleanup);
@@ -245,39 +185,6 @@ export class RigInstantiator {
       };
     }
 
-    // Receipt-bearing imports commit final session configuration, evidence, and
-    // summary events together. Legacy callers retain the historical best-effort path.
-    if (opts?.operation) {
-      const persistedEvents: Array<ReturnType<EventBus["persistWithinTransaction"]>> = [];
-      this.db.transaction(() => {
-        const sessionIds: Array<{ logicalId: string; id: string }> = [];
-        const sessions = this.sessionRegistry.getSessionsForRig(rigId!);
-        for (const specNode of spec.nodes) {
-          const session = sessions.find((row) => row.nodeId === nodeIdMap[specNode.id]);
-          if (!session) continue;
-          const changed = this.db.prepare("UPDATE sessions SET restore_policy = ? WHERE id = ?")
-            .run(specNode.restorePolicy ?? "resume_if_possible", session.id).changes;
-          if (changed !== 1) throw new Error("operation_session_restore_policy_missing");
-          sessionIds.push({ logicalId: specNode.id, id: session.id });
-        }
-        for (const session of sessionIds) {
-          opts.operation!.service.commitEffectWithinTransaction({ operationId: opts.operation!.operationId,
-            step: `config:restore:${session.logicalId}`, kind: "config.restore_policy", targetId: session.id,
-            evidence: { ids: [session.id] }, target: { rigId: rigId!, nodeIds: Object.values(nodeIdMap) },
-            effect: "committed", phase: "configured" });
-        }
-        opts.operation!.service.commitEffectWithinTransaction({ operationId: opts.operation!.operationId,
-          step: "config:session_restore", kind: "config.restore_policy", targetId: rigId!,
-          target: { rigId: rigId!, nodeIds: Object.values(nodeIdMap) },
-          effect: "committed", phase: "configured" });
-        persistedEvents.push(this.eventBus.persistWithinTransaction({
-          type: "topology.roster_recorded", rigId: rigId!,
-          intendedNodeIds: Object.values(nodeIdMap), source: "materialized_topology" }));
-        persistedEvents.push(this.eventBus.persistWithinTransaction({
-          type: "rig.imported", rigId: rigId!, specName: spec.name, specVersion: spec.version }));
-      }).immediate();
-      for (const event of persistedEvents) this.eventBus.notifySubscribers(event);
-    } else {
     // 6. Propagate restorePolicy to session metadata (best-effort)
     try {
       for (const specNode of spec.nodes) {
@@ -310,7 +217,6 @@ export class RigInstantiator {
       });
     } catch {
       // Best-effort: import succeeded even if event persistence fails
-    }
     }
 
     return {
@@ -628,11 +534,10 @@ export class PodRigInstantiator {
     };
   }
 
-  /** Validate a YAML spec before handing its optional receipt to the transactional topology path. */
   async materialize(
     rigSpecYaml: string,
     rigRoot: string,
-    opts?: { targetRigId?: string; suppressSummaryEvent?: boolean; cwdOverride?: string; operation?: OperationContext },
+    opts?: { targetRigId?: string; suppressSummaryEvent?: boolean; cwdOverride?: string },
   ): Promise<MaterializeOutcome> {
     let raw: unknown;
     try {
@@ -694,7 +599,7 @@ export class PodRigInstantiator {
   async materializeStructured(
     raw: unknown,
     rigRoot: string,
-    opts?: { targetRigId?: string; suppressSummaryEvent?: boolean; cwdOverride?: string; operation?: OperationContext },
+    opts?: { targetRigId?: string; suppressSummaryEvent?: boolean; cwdOverride?: string },
   ): Promise<MaterializeOutcome> {
     const targetRig = opts?.targetRigId ? this.deps.rigRepo.getRig(opts.targetRigId) : null;
     if (opts?.targetRigId && !targetRig) {
@@ -747,13 +652,10 @@ export class PodRigInstantiator {
       cwdOverride?: string;
       /** S9: ordinary member growth targets this already-persisted pod. */
       existingPodNamespace?: string;
-      operation?: OperationContext;
     },
   ): Promise<MaterializeOutcome> {
     const persistedEvents: Array<ReturnType<EventBus["persistWithinTransaction"]>> = [];
     const nodeResults: Array<{ logicalId: string; status: "materialized" }> = [];
-    const operationNodeIds: string[] = [];
-    let operationPodId: string | undefined;
 
     // S5b running-name guard (OPR.0.5.4.11) — CREATE branch only: an expansion
     // (targetRigId) adds to an existing rig and never mints a name, so the
@@ -769,12 +671,6 @@ export class PodRigInstantiator {
     try {
       let materializedRigId = opts?.targetRigId ?? "";
       const tx = this.db.transaction(() => {
-        if (opts?.targetRigId) {
-          const target = this.deps.rigRepo.getRig(opts.targetRigId);
-          if (!target) {
-            throw { code: "materialize_conflict", message: "Target rig identity changed during materialization" };
-          }
-        }
         if (!materializedRigId) {
           const rig = this.deps.rigRepo.createRig(rigSpec.name);
           materializedRigId = rig.id;
@@ -810,17 +706,6 @@ export class PodRigInstantiator {
             declaringDir: rigAttachment.origin === "custom" ? rigRoot : null,
             launchPosture: rigAttachment.launchPosture,
           });
-        }
-        if (opts?.operation && !opts.targetRigId) {
-          opts.operation.service.commitEffectWithinTransaction({ operationId: opts.operation.operationId,
-            step: "rig", kind: "topology.rig", targetId: materializedRigId,
-            target: { rigId: materializedRigId, nodeIds: [] }, effect: "committed", phase: "materializing" });
-        }
-        if (opts?.operation && opts.targetRigId && (rigSpec.workspace
-          || rigSpec.managedBlocks?.["claude-code"] || rigSpec.env || rigSpec.permissionPolicy)) {
-          opts.operation.service.commitEffectWithinTransaction({ operationId: opts.operation.operationId,
-            step: "config:target_rig", kind: "config.rig", targetId: materializedRigId,
-            target: { rigId: materializedRigId, nodeIds: [] }, effect: "committed", phase: "configuring" });
         }
 
         const currentRig = this.deps.rigRepo.getRig(materializedRigId)!;
@@ -861,13 +746,6 @@ export class PodRigInstantiator {
             },
           );
           podIdMap[pod.id] = podRecord.id;
-          operationPodId = podRecord.id;
-          if (opts?.operation && !existingPod) {
-            opts.operation.service.commitEffectWithinTransaction({ operationId: opts.operation.operationId,
-              step: `pod:${pod.id}`, kind: "topology.pod", targetId: podRecord.id,
-              target: { rigId: materializedRigId, podId: podRecord.id, nodeIds: [...operationNodeIds] },
-              effect: "committed", phase: "materializing" });
-          }
           if (!existingPod) {
             persistedEvents.push(this.deps.eventBus.persistWithinTransaction({
               type: "pod.created",
@@ -909,13 +787,6 @@ export class PodRigInstantiator {
               }
             }
             nodeResults.push({ logicalId: qualifiedId, status: "materialized" });
-            operationNodeIds.push(node.id);
-            if (opts?.operation) {
-              opts.operation.service.commitEffectWithinTransaction({ operationId: opts.operation.operationId,
-                step: `member:${qualifiedId}`, kind: "topology.member", targetId: node.id,
-                target: { rigId: materializedRigId, podId: operationPodId, nodeIds: [...operationNodeIds] },
-                effect: "committed", phase: "materializing" });
-            }
             persistedEvents.push(event);
           }
         }
@@ -927,11 +798,7 @@ export class PodRigInstantiator {
             if (!fromId || !toId) {
               throw { code: "materialize_conflict", message: `Pod-local edge references missing node: ${pod.id}.${edge.from} -> ${pod.id}.${edge.to}` };
             }
-            const added = this.deps.rigRepo.addEdge(materializedRigId, fromId, toId, edge.kind);
-            if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-              operationId: opts.operation.operationId, step: `edge:${added.id}`, kind: "topology.edge",
-              targetId: added.id, target: { rigId: materializedRigId, podId: operationPodId,
-                nodeIds: [...operationNodeIds] }, effect: "committed", phase: "materializing" });
+            this.deps.rigRepo.addEdge(materializedRigId, fromId, toId, edge.kind);
           }
         }
 
@@ -941,11 +808,7 @@ export class PodRigInstantiator {
           if (!fromId || !toId) {
             throw { code: "materialize_conflict", message: `Cross-pod edge references missing node: ${edge.from} -> ${edge.to}` };
           }
-          const added = this.deps.rigRepo.addEdge(materializedRigId, fromId, toId, edge.kind);
-          if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-            operationId: opts.operation.operationId, step: `edge:${added.id}`, kind: "topology.edge",
-            targetId: added.id, target: { rigId: materializedRigId, podId: operationPodId,
-              nodeIds: [...operationNodeIds] }, effect: "committed", phase: "materializing" });
+          this.deps.rigRepo.addEdge(materializedRigId, fromId, toId, edge.kind);
         }
 
         persistedEvents.push(this.deps.eventBus.persistWithinTransaction({
@@ -976,26 +839,12 @@ export class PodRigInstantiator {
       // to materialize over a defaults copy, but failures are surfaced as
       // named warnings, never swallowed.
       if (this.deps.topologyRootResolver && !opts?.existingPodNamespace) {
-        const operation = opts?.operation;
-        if (operation) operation.service.beginExternalStep({ operationId: operation.operationId,
-          step: "projection:defaults", kind: "external.projection", targetId: materializedRigId,
-          phase: "projecting" });
-        let defaults;
-        try {
-          defaults = installTopologyDefaults({
-            specDir: rigRoot,
-            rigName: rigSpec.name,
-            podIds: rigSpec.pods.map((pod) => pod.id),
-            topologyRoot: this.deps.topologyRootResolver(),
-          });
-        } catch (error) {
-          if (operation) operation.service.finishExternalStep({ operationId: operation.operationId,
-            step: "projection:defaults", state: "indeterminate", external: "indeterminate", phase: "projection_uncertain" });
-          throw error;
-        }
-        if (operation) operation.service.finishExternalStep({ operationId: operation.operationId,
-          step: "projection:defaults", state: "observed",
-          external: defaults.failed.length > 0 ? "incomplete" : "completed", phase: "projected" });
+        const defaults = installTopologyDefaults({
+          specDir: rigRoot,
+          rigName: rigSpec.name,
+          podIds: rigSpec.pods.map((pod) => pod.id),
+          topologyRoot: this.deps.topologyRootResolver(),
+        });
         for (const f of defaults.failed) {
           preflightWarnings.push(`topology-defaults: could not install ${f.path}: ${f.error}`);
         }
@@ -1063,7 +912,7 @@ export class PodRigInstantiator {
     rigRoot: string,
     targetRigId: string,
     cwdOverride?: string,
-    launchOpts?: { keepRecordedAdditions?: boolean; operation?: OperationContext },
+    launchOpts?: { keepRecordedAdditions?: boolean },
   ): Promise<LaunchMaterializedOutcome> {
     const launchOrder = this.computePodLaunchOrder(rigSpec);
     const podWarnings: string[] = [];
@@ -1101,7 +950,6 @@ export class PodRigInstantiator {
         qualifiedId: logicalId,
         nodeId: node.id,
         cwdOverride,
-        operation: launchOpts?.operation,
         ...(launchOpts?.keepRecordedAdditions ? { keepRecordedAdditions: true } : {}),
       });
 
@@ -1152,7 +1000,7 @@ export class PodRigInstantiator {
     rigRoot: string,
     opts?: { cwdOverride?: string; edges?: Array<{ from: string; to: string; kind: string }>;
       /** A fork's source seat: its launch additions are copied into this new seat once it is validated, and kept. */
-      launchAdditionsFrom?: SeatSkillPaths; operation?: OperationContext },
+      launchAdditionsFrom?: SeatSkillPaths },
   ): Promise<AddMemberOutcome> {
     // 1. Resolve the rig.
     const rig = this.deps.rigRepo.getRig(rigId);
@@ -1277,7 +1125,6 @@ export class PodRigInstantiator {
       suppressSummaryEvent: true,
       cwdOverride: opts?.cwdOverride,
       existingPodNamespace: podNamespace,
-      ...(opts?.operation ? { operation: opts.operation } : {}),
     });
     if (!materialized.ok) {
       const message = "message" in materialized
@@ -1292,29 +1139,14 @@ export class PodRigInstantiator {
     }
 
     // A fork's launch additions go only into the seat just validated and created above (OPR.0.7.0.9).
-    const operation = opts?.operation;
-    if (operation) operation.service.beginExternalStep({ operationId: operation.operationId,
-      step: `launch:${qualifiedId}`, kind: "external.launch", targetId: rigId, phase: "launching" });
     const launchAdditions = opts?.launchAdditionsFrom && member.runtime === "claude-code"
       ? carrySeatLaunchAdditions(opts.launchAdditionsFrom, seatSkillPaths({ rigId, logicalId: qualifiedId, runtime: member.runtime }))
       : undefined;
 
     // 9. The shared launch effect owns startup projection + delivery +
     // readiness + `@rigged_*` for both expansion and ordinary growth.
-    let launchOutcome;
-    try {
-      launchOutcome = await this.launchValidatedSpec(rigSpec, rigRoot, rigId, opts?.cwdOverride,
-        { ...(launchAdditions?.kept ? { keepRecordedAdditions: true } : {}),
-          ...(operation ? { operation } : {}) });
-    } catch (error) {
-      if (operation) operation.service.finishExternalStep({ operationId: operation.operationId,
-        step: `launch:${qualifiedId}`, state: "indeterminate", external: "indeterminate", phase: "launch_uncertain" });
-      throw error;
-    }
-    if (operation) operation.service.finishExternalStep({ operationId: operation.operationId,
-      step: `launch:${qualifiedId}`, state: "observed",
-      external: launchOutcome.ok && launchOutcome.result.nodes.every((node) => node.status === "launched")
-        ? "completed" : "incomplete", phase: "launched" });
+    const launchOutcome = await this.launchValidatedSpec(rigSpec, rigRoot, rigId, opts?.cwdOverride,
+      launchAdditions?.kept ? { keepRecordedAdditions: true } : undefined);
     if (!launchOutcome.ok) {
       const message = "message" in launchOutcome
         ? launchOutcome.message
@@ -1445,14 +1277,13 @@ export class PodRigInstantiator {
     return { ok: true, rigId, nodeId, logicalId: node.logicalId, status: "launched", sessionName: result.sessionName, warnings: result.warnings };
   }
 
-  /** Serialize same-name imports before receipt-bearing topology and launch work begins. */
-  async instantiate(rigSpecYaml: string, rigRoot: string, opts?: { nonInterruptive?: boolean; cwdOverride?: string; env?: SeatEnv; installRoot?: string; force?: boolean; operation?: OperationContext; prelaunchHook?: (rigId: string, replacedRigIds: readonly string[]) => Promise<{ ok: true; rollback?: () => Promise<void> } | { ok: false; code: string; message: string; retainRig?: boolean }> }): Promise<InstantiateOutcome> {
+  async instantiate(rigSpecYaml: string, rigRoot: string, opts?: { nonInterruptive?: boolean; cwdOverride?: string; env?: SeatEnv; installRoot?: string; force?: boolean; prelaunchHook?: (rigId: string, replacedRigIds: readonly string[]) => Promise<{ ok: true; rollback?: () => Promise<void> } | { ok: false; code: string; message: string; retainRig?: boolean }> }): Promise<InstantiateOutcome> {
     // #141: while an import may archive a stopped same-name generation, allow one import per rig name at
     // a time on this daemon. Otherwise two imports could each replace it, or one could archive the other's
     // in-progress replacement. Unrelated names are unaffected; an adapter that cannot probe keeps today's
     // behavior.
     let name: string | null = null;
-    if (this.deps.tmuxAdapter?.probeSession || opts?.operation) {
+    if (this.deps.tmuxAdapter?.probeSession) {
       try {
         const parsed = PodRigSpecCodec.parse(rigSpecYaml) as { name?: unknown };
         name = typeof parsed?.name === "string" ? parsed.name : null;
@@ -1472,8 +1303,7 @@ export class PodRigInstantiator {
     }
   }
 
-  /** Carry one accepted receipt through topology, external launch, and compensation boundaries. */
-  private async instantiateOnce(rigSpecYaml: string, rigRoot: string, opts?: { nonInterruptive?: boolean; cwdOverride?: string; env?: SeatEnv; installRoot?: string; force?: boolean; operation?: OperationContext; prelaunchHook?: (rigId: string, replacedRigIds: readonly string[]) => Promise<{ ok: true; rollback?: () => Promise<void> } | { ok: false; code: string; message: string; retainRig?: boolean }> }): Promise<InstantiateOutcome> {
+  private async instantiateOnce(rigSpecYaml: string, rigRoot: string, opts?: { nonInterruptive?: boolean; cwdOverride?: string; env?: SeatEnv; installRoot?: string; force?: boolean; prelaunchHook?: (rigId: string, replacedRigIds: readonly string[]) => Promise<{ ok: true; rollback?: () => Promise<void> } | { ok: false; code: string; message: string; retainRig?: boolean }> }): Promise<InstantiateOutcome> {
     // 1. Parse + validate
     let rigSpec: PodRigSpec;
     try {
@@ -1551,40 +1381,41 @@ export class PodRigInstantiator {
           if (current.join(",") !== [...priorGenerations].sort().join(",")) throw new GenerationChanged(rigSpec.name);
           for (const id of archivedGenerations) {
             if (makeRunningSessionCounter(this.db)(id) > 0 || !this.deps.rigRepo.archiveRig(id)) throw new GenerationChanged(rigSpec.name);
-            if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-              operationId: opts.operation.operationId, step: `archive:${id}`, kind: "topology.archive",
-              targetId: id, target: { nodeIds: [] }, effect: "partial", phase: "archiving" });
           }
         }
-        const rig = this.deps.rigRepo.createRig(rigSpec.name, opts?.installRoot);
-        const nonInterruptive = opts?.nonInterruptive ?? rigSpec.nonInterruptive;
-        if (nonInterruptive !== undefined) this.deps.rigRepo.setRigNonInterruptive(rig.id, nonInterruptive);
-        if (rigSpec.workspace) this.deps.rigRepo.setRigWorkspace(rig.id, rigSpec.workspace);
-        if (rigSpec.managedBlocks?.["claude-code"]) {
-          this.deps.rigRepo.setRigClaudeManagedBlockFile(rig.id, rigSpec.managedBlocks["claude-code"]);
-        }
-        this.persistRigStartupLayers(rig.id, rigSpec, rigRoot);
-        if (rigSpec.env) this.deps.rigRepo.setRigEnv(rig.id, rigSpec.env);
-        if (rigSpec.permissionPolicy) {
-          this.deps.rigRepo.setRigPermissionPolicy(rig.id, rigSpec.permissionPolicy);
-          const rigAttachment = resolvePermissionPolicyAttachment(rigSpec.permissionPolicy, rigRoot, {
-            readFile: (p) => this.deps.fsOps.readFile(p),
-          });
-          this.deps.rigRepo.setRigPolicyProvenance(rig.id, {
-            origin: rigAttachment.origin,
-            resolvedTarget: rigAttachment.resolvedTarget ?? null,
-            declaringDir: rigAttachment.origin === "custom" ? rigRoot : null,
-            launchPosture: rigAttachment.launchPosture,
-          });
-        }
-        if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-          operationId: opts.operation.operationId, step: "rig", kind: "topology.rig", targetId: rig.id,
-          target: { rigId: rig.id, nodeIds: [] }, effect: "committed", phase: "created" });
-        return rig;
+        return this.deps.rigRepo.createRig(rigSpec.name, opts?.installRoot);
       });
       const rig = create();
       rigId = rig.id;
       createdRigId = rig.id;
+      const nonInterruptive = opts?.nonInterruptive ?? rigSpec.nonInterruptive;
+      if (nonInterruptive !== undefined) this.deps.rigRepo.setRigNonInterruptive(rigId, nonInterruptive);
+      // PL-007: persist typed workspace block (when declared) on the rig
+      // record. Whoami / node-inventory read it via getRigWorkspace().
+      if (rigSpec.workspace) {
+        this.deps.rigRepo.setRigWorkspace(rigId, rigSpec.workspace);
+      }
+      // #25: the second rig-persist site (see materializeValidatedSpec).
+      if (rigSpec.managedBlocks?.["claude-code"]) {
+        this.deps.rigRepo.setRigClaudeManagedBlockFile(rigId, rigSpec.managedBlocks["claude-code"]);
+      }
+      this.persistRigStartupLayers(rigId, rigSpec, rigRoot);
+      // OPR.0.4.8.3 Seam B: the SECOND rig-persist site (bootstrap instantiate path) —
+      // both sites must write or the rig ref silently drops on one instantiate path.
+      // Guard-F1: resolved rig attachment persists here too (declaringDir = rigRoot).
+      if (rigSpec.env) this.deps.rigRepo.setRigEnv(rigId, rigSpec.env);
+      if (rigSpec.permissionPolicy) {
+        this.deps.rigRepo.setRigPermissionPolicy(rigId, rigSpec.permissionPolicy);
+        const rigAttachment = resolvePermissionPolicyAttachment(rigSpec.permissionPolicy, rigRoot, {
+          readFile: (p) => this.deps.fsOps.readFile(p),
+        });
+        this.deps.rigRepo.setRigPolicyProvenance(rigId, {
+          origin: rigAttachment.origin,
+          resolvedTarget: rigAttachment.resolvedTarget ?? null,
+          declaringDir: rigAttachment.origin === "custom" ? rigRoot : null,
+          launchPosture: rigAttachment.launchPosture,
+        });
+      }
     } catch (err) {
       if (err instanceof GenerationChanged) return { ok: false, code: "generation_unconfirmed", message: err.message };
       // #141: a replacement that failed to finish creating must not leave the prior generation hidden.
@@ -1596,25 +1427,6 @@ export class PodRigInstantiator {
     const nodeResults: { logicalId: string; status: "launched" | "failed" | "attention_required"; code?: string; error?: string; evidence?: string; sessionName?: string }[] = [];
     const nodeIdMap: Record<string, string> = {}; // "pod.member" -> node DB id
     const launchedSessionNames: string[] = []; // Track for orphan cleanup on total failure
-    const compensateTopology = () => {
-      if (!opts?.operation) {
-        this.deps.rigRepo.deleteRig(rigId);
-        restoreArchived();
-        return;
-      }
-      this.db.transaction(() => {
-        const operation = opts.operation!;
-        const current = operation.service.read(operation.operationId)!;
-        const owned = operation.service.repository.readSteps(operation.operationId)
-          .filter((step) => step.state === "committed" && step.kind.startsWith("topology."));
-        this.deps.rigRepo.deleteRig(rigId);
-        restoreArchived();
-        owned.forEach((step, index) => operation.service.commitEffectWithinTransaction({
-          operationId: operation.operationId, step: step.step, kind: step.kind,
-          targetId: step.targetId, state: "compensated", target: current.target,
-          effect: index === owned.length - 1 ? "rolled_back" : "partial", phase: "compensating" }));
-      }).immediate();
-    };
     const podInstantiateWarnings = preflight.warnings;
     for (const id of archivedGenerations) {
       podInstantiateWarnings.push(`Archived the stopped earlier "${rigSpec.name}" rig ${id}; its records are kept. Restore it with: rig unarchive ${id}`);
@@ -1629,8 +1441,6 @@ export class PodRigInstantiator {
     // wrapper makes even a broken injected fsOps a named warning, never a
     // failed rig.
     if (this.deps.topologyRootResolver) {
-      if (opts?.operation) opts.operation.service.beginExternalStep({ operationId: opts.operation.operationId,
-        step: "projection:defaults", kind: "external.projection", targetId: rigId, phase: "projecting" });
       try {
         const defaults = installTopologyDefaults({
           specDir: rigRoot,
@@ -1641,12 +1451,7 @@ export class PodRigInstantiator {
         for (const f of defaults.failed) {
           podInstantiateWarnings.push(`topology-defaults: could not install ${f.path}: ${f.error}`);
         }
-        if (opts?.operation) opts.operation.service.finishExternalStep({ operationId: opts.operation.operationId,
-          step: "projection:defaults", state: "observed",
-          external: defaults.failed.length > 0 ? "incomplete" : "completed", phase: "projected" });
       } catch (err) {
-        if (opts?.operation) opts.operation.service.finishExternalStep({ operationId: opts.operation.operationId,
-          step: "projection:defaults", state: "indeterminate", external: "indeterminate", phase: "projection_uncertain" });
         podInstantiateWarnings.push(`topology-defaults: installer failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -1660,24 +1465,13 @@ export class PodRigInstantiator {
     for (const pod of rigSpec.pods) {
       let podId: string;
       try {
-        const podRecord = opts?.operation ? this.db.transaction(() => {
-          const created = this.deps.podRepo.createPod(rigId, pod.id, pod.label, {
-            summary: pod.summary,
-            continuityPolicyJson: pod.continuityPolicy ? JSON.stringify(pod.continuityPolicy) : undefined,
-          });
-          recordOperationEffect(opts.operation!, { operationId: opts.operation!.operationId,
-            step: `pod:${pod.id}`, kind: "topology.pod", targetId: created.id,
-            target: { rigId, podId: created.id, nodeIds: Object.values(nodeIdMap) },
-            effect: "committed", phase: "creating_pods" });
-          return created;
-        }).immediate() : this.deps.podRepo.createPod(rigId, pod.id, pod.label, {
+        const podRecord = this.deps.podRepo.createPod(rigId, pod.id, pod.label, {
           summary: pod.summary,
           continuityPolicyJson: pod.continuityPolicy ? JSON.stringify(pod.continuityPolicy) : undefined,
         });
         podId = podRecord.id;
         podIdMap[pod.id] = podId;
       } catch (err) {
-        if (err instanceof OperationJournalFailure) throw err;
         nodeResults.push(...pod.members.map((m) => ({ logicalId: `${pod.id}.${m.id}`, status: "failed" as const, error: `Pod creation failed: ${(err as Error).message}` })));
         continue;
       }
@@ -1697,21 +1491,11 @@ export class PodRigInstantiator {
     // via ON DELETE CASCADE so deleting the rig is sufficient.
     let rollbackServices: (() => Promise<void>) | undefined;
     if (opts?.prelaunchHook) {
-      if (opts.operation) opts.operation.service.beginExternalStep({ operationId: opts.operation.operationId,
-        step: "services:boot", kind: "external.service_boot", targetId: rigId, phase: "booting_services" });
-      let hookResult;
-      try { hookResult = await opts.prelaunchHook(rigId, archivedGenerations); }
-      catch (error) {
-        if (opts.operation) opts.operation.service.finishExternalStep({ operationId: opts.operation.operationId,
-          step: "services:boot", state: "indeterminate", external: "indeterminate", phase: "service_boot_uncertain" });
-        throw error;
-      }
-      if (opts.operation) opts.operation.service.finishExternalStep({ operationId: opts.operation.operationId,
-        step: "services:boot", state: "observed", external: hookResult.ok ? "completed" : "incomplete",
-        phase: "services_booted" });
+      const hookResult = await opts.prelaunchHook(rigId, archivedGenerations);
       if (!hookResult.ok) {
         if (!hookResult.retainRig) {
-          compensateTopology();
+          this.deps.rigRepo.deleteRig(rigId);
+          restoreArchived();
         }
         return { ok: false, code: hookResult.code === "compose_project_conflict" ? "compose_project_conflict" : "service_boot_failed", message: hookResult.message };
       }
@@ -1725,7 +1509,6 @@ export class PodRigInstantiator {
         if (member.agentRef === "builtin:terminal") {
           const termResult = await this.processTerminalMember(
             rigId, rigSpec, rigRoot, pod, member, podId, qualifiedId, nodeIdMap, launchedSessionNames, podInstantiateWarnings, opts?.cwdOverride, opts?.env,
-            opts?.operation,
           );
           nodeResults.push(termResult);
           continue;
@@ -1802,10 +1585,6 @@ export class PodRigInstantiator {
           // null, and resolveRestorePosture fell through to rig full_bypass.)
           const bootstrapAttachment = this.resolveMemberPolicyAttachment(member.permissionPolicy, rigSpec.permissionPolicy, rigRoot);
           if (bootstrapAttachment) this.persistNodePolicyProvenanceStrict(node.id, bootstrapAttachment);
-          if (opts?.operation) recordOperationEffect(opts.operation, {
-            operationId: opts.operation.operationId, step: `member:${qualifiedId}`, kind: "topology.member",
-            targetId: node.id, target: { rigId, podId, nodeIds: [...Object.values(nodeIdMap), node.id] },
-            effect: "committed", phase: "creating_members" });
           return node.id;
         });
         let nodeId: string;
@@ -1814,15 +1593,11 @@ export class PodRigInstantiator {
           // nodeIdMap only AFTER the atomic unit succeeds (Guard contract item 2).
           nodeIdMap[qualifiedId] = nodeId;
         } catch (err) {
-          if (err instanceof OperationJournalFailure) throw err;
           nodeResults.push({ logicalId: qualifiedId, status: "failed", error: (err as Error).message });
           continue;
         }
 
-        if (opts?.operation) opts.operation.service.beginExternalStep({ operationId: opts.operation.operationId,
-          step: `launch:${qualifiedId}`, kind: "external.launch", targetId: nodeId, phase: "launching" });
-        let launched;
-        try { launched = await this.launchExistingAgentMember({
+        const launched = await this.launchExistingAgentMember({
           rigId,
           rigSpec,
           rigRoot,
@@ -1835,14 +1610,7 @@ export class PodRigInstantiator {
           nodeId,
           resolveResult,
           configResult,
-        }); } catch (error) {
-          if (opts?.operation) opts.operation.service.finishExternalStep({ operationId: opts.operation.operationId,
-            step: `launch:${qualifiedId}`, state: "indeterminate", external: "indeterminate", phase: "launch_uncertain" });
-          throw error;
-        }
-        if (opts?.operation) opts.operation.service.finishExternalStep({ operationId: opts.operation.operationId,
-          step: `launch:${qualifiedId}`, state: "observed",
-          external: launched.status === "launched" ? "completed" : "incomplete", phase: "launched" });
+        });
         if (launched.sessionName) {
           launchedSessionNames.push(launched.sessionName);
         }
@@ -1865,15 +1633,9 @@ export class PodRigInstantiator {
         const fromId = nodeIdMap[`${pod.id}.${edge.from}`];
         const toId = nodeIdMap[`${pod.id}.${edge.to}`];
         if (fromId && toId) {
-          const add = () => {
-            const created = this.deps.rigRepo.addEdge(rigId, fromId, toId, edge.kind);
-            if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-              operationId: opts.operation.operationId, step: `edge:${created.id}`, kind: "topology.edge",
-              targetId: created.id, target: { rigId, podId: podIdMap[pod.id], nodeIds: Object.values(nodeIdMap) },
-              effect: "committed", phase: "creating_edges" });
-          };
-          if (opts?.operation) this.db.transaction(add).immediate();
-          else try { add(); } catch { /* best-effort for legacy callers */ }
+          try {
+            this.deps.rigRepo.addEdge(rigId, fromId, toId, edge.kind);
+          } catch { /* best-effort */ }
         }
       }
     }
@@ -1883,15 +1645,9 @@ export class PodRigInstantiator {
       const fromId = nodeIdMap[edge.from];
       const toId = nodeIdMap[edge.to];
       if (fromId && toId) {
-        const add = () => {
-          const created = this.deps.rigRepo.addEdge(rigId, fromId, toId, edge.kind);
-          if (opts?.operation) opts.operation.service.commitEffectWithinTransaction({
-            operationId: opts.operation.operationId, step: `edge:${created.id}`, kind: "topology.edge",
-            targetId: created.id, target: { rigId, nodeIds: Object.values(nodeIdMap) },
-            effect: "committed", phase: "creating_edges" });
-        };
-        if (opts?.operation) this.db.transaction(add).immediate();
-        else try { add(); } catch { /* best-effort for legacy callers */ }
+        try {
+          this.deps.rigRepo.addEdge(rigId, fromId, toId, edge.kind);
+        } catch { /* best-effort */ }
       }
     }
 
@@ -1916,7 +1672,7 @@ export class PodRigInstantiator {
       let serviceCleanupError: string | undefined;
       const cleanup = async () => {
         if (this.deps.tmuxAdapter) {
-          for (const [index, sessionName] of launchedSessionNames.entries()) {
+          for (const sessionName of launchedSessionNames) {
             if (this.deps.tmuxAdapter.probeSession) {
               let probe;
               try {
@@ -1927,32 +1683,18 @@ export class PodRigInstantiator {
               if (probe.state === "absent") continue;
               if (probe.state !== "present") return;
             }
-            if (opts?.operation) opts.operation.service.beginExternalStep({ operationId: opts.operation.operationId,
-              step: `cleanup:session:${index}`, kind: "external.cleanup", targetId: rigId,
-              phase: "cleaning" });
             const stopped = await this.deps.tmuxAdapter.killSession(sessionName);
-            if (opts?.operation) opts.operation.service.finishExternalStep({ operationId: opts.operation.operationId,
-              step: `cleanup:session:${index}`, state: "observed",
-              external: stopped.ok ? "completed" : "incomplete", phase: "cleaning" });
             if (!stopped.ok && (stopped.code !== "session_not_found" || /no server running/i.test(stopped.message ?? ""))) return;
           }
         }
         try {
-          if (rollbackServices && opts?.operation) opts.operation.service.beginExternalStep({
-            operationId: opts.operation.operationId, step: "cleanup:services", kind: "external.cleanup",
-            targetId: rigId, phase: "cleaning_services" });
           await rollbackServices?.();
-          if (rollbackServices && opts?.operation) opts.operation.service.finishExternalStep({
-            operationId: opts.operation.operationId, step: "cleanup:services", state: "observed",
-            external: "completed", phase: "services_cleaned" });
         } catch (error) {
-          if (rollbackServices && opts?.operation) opts.operation.service.finishExternalStep({
-            operationId: opts.operation.operationId, step: "cleanup:services", state: "indeterminate",
-            external: "indeterminate", phase: "service_cleanup_uncertain" });
           serviceCleanupError = `Service cleanup failed; rig ${rigId} retained for recovery: ${String(error)}`;
           return;
         }
-        compensateTopology();
+        this.deps.rigRepo.deleteRig(rigId);
+        restoreArchived();
       };
       const guard = this.deps.tmuxAdapter?.deliveryGuard;
       if (guard) await guard.lifecycle(Object.values(nodeIdMap), cleanup);
@@ -2091,7 +1833,6 @@ export class PodRigInstantiator {
     return order;
   }
 
-  /** Journal terminal node creation and the uncertain launch before reporting readiness. */
   private async processTerminalMember(
     rigId: string,
     rigSpec: PodRigSpec,
@@ -2105,14 +1846,12 @@ export class PodRigInstantiator {
     warnings: string[],
     cwdOverride?: string,
     envOverride?: SeatEnv,
-    operation?: OperationContext,
   ): Promise<{ logicalId: string; status: "launched" | "failed"; code?: string; error?: string }> {
     const effectiveCwd = resolveLaunchCwd(member.cwd, rigRoot, cwdOverride);
     // Create node with sentinel values
     let nodeId: string;
     try {
-      const createNode = () => {
-        const node = this.deps.rigRepo.addNode(rigId, qualifiedId, {
+      const node = this.deps.rigRepo.addNode(rigId, qualifiedId, {
         runtime: member.runtime,
         model: member.model,
         effort: member.effort,
@@ -2124,29 +1863,14 @@ export class PodRigInstantiator {
         agentRef: member.agentRef,
         profile: member.profile,
         label: member.label,
-        });
-        if (operation) {
-          const terminalAttachment = this.resolveMemberPolicyAttachment(member.permissionPolicy,
-            rigSpec.permissionPolicy, rigRoot);
-          if (terminalAttachment) this.persistNodePolicyProvenanceStrict(node.id, terminalAttachment);
-        }
-        if (operation) recordOperationEffect(operation, { operationId: operation.operationId,
-          step: `member:${qualifiedId}`, kind: "topology.member", targetId: node.id,
-          target: { rigId, podId, nodeIds: [...Object.values(nodeIdMap), node.id] },
-          effect: "committed", phase: "creating_members" });
-        return node.id;
-      };
-      nodeId = operation ? this.db.transaction(createNode).immediate() : createNode();
+      });
+      nodeId = node.id;
       nodeIdMap[qualifiedId] = nodeId;
     } catch (err) {
-      if (err instanceof OperationJournalFailure) throw err;
       return { logicalId: qualifiedId, status: "failed", error: (err as Error).message };
     }
 
-    if (operation) operation.service.beginExternalStep({ operationId: operation.operationId,
-      step: `launch:${qualifiedId}`, kind: "external.launch", targetId: nodeId, phase: "launching" });
-    let launched;
-    try { launched = await this.launchExistingTerminalMember({
+    const launched = await this.launchExistingTerminalMember({
       rigId,
       rigSpec,
       rigRoot,
@@ -2156,15 +1880,7 @@ export class PodRigInstantiator {
       member,
       qualifiedId,
       nodeId,
-      operation,
-    }); } catch (error) {
-      if (operation) operation.service.finishExternalStep({ operationId: operation.operationId,
-        step: `launch:${qualifiedId}`, state: "indeterminate", external: "indeterminate", phase: "launch_uncertain" });
-      throw error;
-    }
-    if (operation) operation.service.finishExternalStep({ operationId: operation.operationId,
-      step: `launch:${qualifiedId}`, state: "observed",
-      external: launched.status === "launched" ? "completed" : "incomplete", phase: "launched" });
+    });
     if (launched.sessionName) {
       launchedSessionNames.push(launched.sessionName);
     }
@@ -2269,7 +1985,6 @@ export class PodRigInstantiator {
     cwdOverride?: string;
     envOverride?: SeatEnv;
     keepRecordedAdditions?: boolean;
-    operation?: OperationContext;
   }): Promise<{ status: "launched" | "failed" | "attention_required"; error?: string; evidence?: string; sessionName?: string; warnings?: string[] }> {
     return input.member.agentRef === "builtin:terminal"
       ? this.launchExistingTerminalMember(input)
@@ -2805,7 +2520,6 @@ export class PodRigInstantiator {
     };
   }
 
-  /** Preserve launch uncertainty when the terminal delivery guard runs an existing member. */
   private async launchExistingTerminalMember(input: {
     rigId: string;
     rigSpec: PodRigSpec;
@@ -2816,7 +2530,6 @@ export class PodRigInstantiator {
     nodeId: string;
     cwdOverride?: string;
     envOverride?: SeatEnv;
-    operation?: OperationContext;
   }): Promise<{ status: "launched" | "failed"; code?: string; error?: string; sessionName?: string; warnings?: string[] }> {
     const guard = this.deps.tmuxAdapter?.deliveryGuard;
     if (guard && !guard.ownsLifecycle(input.nodeId)) {
@@ -2840,29 +2553,15 @@ export class PodRigInstantiator {
       return { status: "failed", code: launchResult.code, error: launchResult.message };
     }
 
-    if (input.operation) {
-      this.db.transaction(() => {
-        const nodeWrite = this.db.prepare("UPDATE nodes SET restore_policy = ? WHERE id = ?")
-          .run("checkpoint_only", input.nodeId).changes;
-        const sessionWrite = this.db.prepare("UPDATE sessions SET restore_policy = ? WHERE id = ?")
-          .run("checkpoint_only", launchResult.session.id).changes;
-        if (nodeWrite !== 1 || sessionWrite !== 1) throw new Error("operation_terminal_restore_policy_missing");
-        const receipt = input.operation!.service.read(input.operation!.operationId)!;
-        recordOperationEffect(input.operation!, { operationId: input.operation!.operationId,
-          step: `config:restore:${input.qualifiedId}`, kind: "config.restore_policy", targetId: input.nodeId,
-          evidence: { ids: [input.nodeId, launchResult.session.id] }, target: receipt.target,
-          effect: receipt.effect, phase: "configuring" });
-      }).immediate();
-    } else {
-      try {
-        this.db.prepare("UPDATE nodes SET restore_policy = ? WHERE id = ?")
-          .run("checkpoint_only", input.nodeId);
-      } catch { /* best-effort */ }
-      try {
-        this.db.prepare("UPDATE sessions SET restore_policy = ? WHERE id = ?")
-          .run("checkpoint_only", launchResult.session.id);
-      } catch { /* best-effort */ }
-    }
+    try {
+      this.db.prepare("UPDATE nodes SET restore_policy = ? WHERE id = ?")
+        .run("checkpoint_only", input.nodeId);
+    } catch { /* best-effort */ }
+
+    try {
+      this.db.prepare("UPDATE sessions SET restore_policy = ? WHERE id = ?")
+        .run("checkpoint_only", launchResult.session.id);
+    } catch { /* best-effort */ }
 
     const terminalRigLayers = this.rigStartupLayers(input.rigSpec, input.rigRoot, input.rigId);
     const startup = resolveStartup({

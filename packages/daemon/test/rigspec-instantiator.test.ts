@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -16,8 +15,6 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { NodeLauncher } from "../src/domain/node-launcher.js";
 import { RigSpecPreflight } from "../src/domain/rigspec-preflight.js";
 import { RigInstantiator } from "../src/domain/rigspec-instantiator.js";
-import { OperationRepository } from "../src/domain/operation-repository.js";
-import { OperationService } from "../src/domain/operation-service.js";
 import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
 import type { ExecFn } from "../src/adapters/tmux.js";
 import type { LegacyRigSpec as RigSpec, PersistedEvent } from "../src/domain/types.js"; // TODO: AS-T08b — migrate to pod-aware RigSpec
@@ -415,56 +412,6 @@ describe("RigInstantiator", () => {
       const importedEvents = db.prepare("SELECT * FROM events WHERE type = 'rig.imported'").all();
       expect(importedEvents).toHaveLength(0);
     }
-  });
-
-  it("operation import rolls back final restore policy, event, and journal on event fault", async () => {
-    const inst = createInstantiator();
-    const spec = validSpec({ nodes: [{ id: "worker", runtime: "claude-code", cwd: "/",
-      restorePolicy: "checkpoint_only" }], edges: [] });
-    const service = new OperationService(new OperationRepository(db));
-    const operationId = randomUUID();
-    service.reserve({ operationId, kind: "rig.import", targetIds: {},
-      payload: { name: spec.name }, options: {}, expectsExternal: true });
-    const persist = eventBus.persistWithinTransaction.bind(eventBus);
-    vi.spyOn(eventBus, "persistWithinTransaction").mockImplementation((event) => {
-      if (event.type === "rig.imported") throw new Error("injected summary event fault");
-      return persist(event);
-    });
-
-    await expect(inst.instantiate(spec, { operation: { service, operationId } }))
-      .rejects.toThrow("injected summary event fault");
-    const rig = rigRepo.listRigs()[0]!;
-    const session = sessionRegistry.getSessionsForRig(rig.id)[0]!;
-    expect(db.prepare("SELECT restore_policy FROM sessions WHERE id = ?").get(session.id))
-      .toEqual({ restore_policy: "resume_if_possible" });
-    expect(service.read(operationId)?.effects.some((step) => step.step === "config:session_restore")).toBe(false);
-    expect(db.prepare("SELECT type FROM events WHERE type IN ('topology.roster_recorded', 'rig.imported')").all())
-      .toHaveLength(0);
-  });
-
-  it("operation import rolls back final restore policy and events on receipt fault", async () => {
-    const inst = createInstantiator();
-    const spec = validSpec({ nodes: [{ id: "worker", runtime: "claude-code", cwd: "/",
-      restorePolicy: "checkpoint_only" }], edges: [] });
-    const service = new OperationService(new OperationRepository(db));
-    const operationId = randomUUID();
-    service.reserve({ operationId, kind: "rig.import", targetIds: {},
-      payload: { name: spec.name }, options: {}, expectsExternal: true });
-    const commit = service.commitEffectWithinTransaction.bind(service);
-    vi.spyOn(service, "commitEffectWithinTransaction").mockImplementation((effect) => {
-      if (effect.step === "config:session_restore") throw new Error("injected receipt fault");
-      commit(effect);
-    });
-
-    await expect(inst.instantiate(spec, { operation: { service, operationId } }))
-      .rejects.toThrow("injected receipt fault");
-    const rig = rigRepo.listRigs()[0]!;
-    const session = sessionRegistry.getSessionsForRig(rig.id)[0]!;
-    expect(db.prepare("SELECT restore_policy FROM sessions WHERE id = ?").get(session.id))
-      .toEqual({ restore_policy: "resume_if_possible" });
-    expect(service.read(operationId)?.effects.some((step) => step.step === "config:session_restore")).toBe(false);
-    expect(db.prepare("SELECT type FROM events WHERE type IN ('topology.roster_recorded', 'rig.imported')").all())
-      .toHaveLength(0);
   });
 
   it("restorePolicy propagation fails -> ok: true (best-effort)", async () => {

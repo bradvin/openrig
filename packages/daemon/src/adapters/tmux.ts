@@ -905,6 +905,10 @@ export class TmuxAdapter {
     }
   }
 
+  /**
+   * Kill one exact session; checked callers can revalidate their review before the
+   * kill command, including after detaching clients, and learn if that detach occurred.
+   */
   async killSession(name: string, assertReviewedState?: (afterDetach: boolean) => void): Promise<TmuxResult> {
     if (this.deliveryGuard) {
       return this.guardedInput(name, async pane => {
@@ -923,6 +927,7 @@ export class TmuxAdapter {
     return this.killSessionUnchecked(name, assertReviewedState);
   }
 
+  /** Run detach and kill against an exact target, marking failures after detach as partial effects. */
   private async killSessionUnchecked(name: string, assertReviewedState?: (afterDetach: boolean) => void): Promise<TmuxResult> {
     // The guarded path passes the immutable `$N` id, which stays as it is; a bare name is made exact.
     const session = exactTarget(name, "session");

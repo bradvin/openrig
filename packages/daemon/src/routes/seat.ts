@@ -25,6 +25,7 @@ import { validSeatReview, type SeatReview } from "../domain/seat-review.js";
 
 export const seatRoutes = new Hono();
 
+/** Distinguish an omitted check from a supplied malformed token at the HTTP boundary. */
 function expectedFromBody(body: Record<string, unknown>): { expected?: SeatReview; invalid?: boolean } {
   if (!Object.hasOwn(body, "expected")) return {};
   return validSeatReview(body.expected) ? { expected: body.expected } : { invalid: true };

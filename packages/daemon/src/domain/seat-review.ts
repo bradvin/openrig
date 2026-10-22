@@ -27,6 +27,7 @@ export interface SeatReviewDescriptor {
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 const tokenHash = (value: unknown): string | null => typeof value === "string" && value.trim() ? sha256(value) : null;
 
+/** Sort object keys recursively so equivalent JSON objects produce the same revision input. */
 function canonicalJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalJson);
   if (value !== null && typeof value === "object") {
@@ -36,14 +37,18 @@ function canonicalJson(value: unknown): unknown {
   return value;
 }
 
+/** Normalize persisted startup JSON for hashing without including transient formatting. */
 function startupJsonProjection(value: unknown): unknown {
   if (typeof value !== "string") return { state: "non_text", value: value ?? null };
   try { return { state: "json", value: canonicalJson(JSON.parse(value)) }; }
   catch { return { state: "malformed", rawHash: sha256(value) }; }
 }
 
-/** Read all revision inputs on one SQLite snapshot. This projection has an explicit
- * version and omits polling timestamps and raw native tokens. */
+/**
+ * Read the review descriptor and its revision inputs from one SQLite snapshot.
+ * The versioned revision excludes polling timestamps and hashes native tokens rather
+ * than returning their values, so callers can compare state without exposing secrets.
+ */
 export function readSeatReview(db: Database.Database, nodeId: string): SeatReviewDescriptor | null {
   return db.transaction(() => {
     const row = db.prepare(`SELECT n.*, r.name AS rig_name, r.archived_at AS rig_archived_at,
@@ -107,6 +112,7 @@ export function readSeatReview(db: Database.Database, nodeId: string): SeatRevie
   })();
 }
 
+/** Validate the external review-token shape before a checked mutation reaches service logic. */
 export function validSeatReview(value: unknown): value is SeatReview {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
@@ -121,6 +127,7 @@ export function validSeatReview(value: unknown): value is SeatReview {
     && h.sessionId === v.latestSessionId;
 }
 
+/** Compare token identity and revision, including the latest history identity when present. */
 export function sameSeatReview(expected: SeatReview, current: SeatReview): boolean {
   return expected.contract === current.contract && expected.rigId === current.rigId
     && expected.nodeId === current.nodeId && expected.revision === current.revision

@@ -322,6 +322,10 @@ export class SeatLifecycleService {
     this.piRecords = deps.piRecords ?? null;
   }
 
+  /**
+   * Resolve one seat and return its persisted review token plus a best-effort live probe.
+   * A thrown probe error is represented as unverified; it does not invalidate the DB snapshot.
+   */
   async reviewSeat(seatRef: string): Promise<SeatReviewDescriptor | SeatRefusal> {
     const resolved = this.resolveSeat(seatRef);
     if ("code" in resolved) return resolved;
@@ -359,6 +363,7 @@ export class SeatLifecycleService {
       current: "code" in resolved ? null : readSeatReview(this.db, resolved.nodeId) };
   }
 
+  /** Refresh state after a stop may have had an external effect, falling back to persisted state. */
   private async refreshedAfterStop(seatRef: string, nodeId: string): Promise<SeatReviewDescriptor | null> {
     const observed = await this.reviewSeat(seatRef);
     return "code" in observed ? readSeatReview(this.db, nodeId) : observed;
@@ -733,6 +738,10 @@ export class SeatLifecycleService {
     return probe.state === "present" ? { state: "yes" } : { state: "no", detail: "tmux session absent" };
   }
 
+  /**
+   * Save a seat's native permission choice for future managed launches. When expected
+   * is supplied, custody and the write transaction recheck the reviewed revision.
+   */
   async setPermissions(input: { seatRef: string; mode: string; reason: string; actor: string; expected?: SeatReview }): Promise<
     | { ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string; review?: SeatReview }
     | SeatRefusal
@@ -801,7 +810,8 @@ export class SeatLifecycleService {
    *  the raw ref and the provenance the instantiator would persist for the same member ref; restore,
    *  resume and launches that read the seat's stored state use that provenance, while a launch from a
    *  spec that declares a policy re-applies the spec's. The ref is validated exactly as a spec
-   *  member's is; the running process is untouched. */
+   *  member's is; the running process is untouched. If a review token is supplied, it is checked
+   *  while acquiring custody and again in the transaction that records the audited selection. */
   async setPolicy(input: { seatRef: string; ref: string; reason: string; actor: string; expected?: SeatReview }): Promise<SetPolicyResult> {
     if (input.expected !== undefined && !validSeatReview(input.expected)) return { ok: false, code: "invalid_review", message: "Invalid seat review token." };
     const required = this.requireReason(input.reason);
@@ -884,6 +894,10 @@ export class SeatLifecycleService {
     return { ok: true, seat, from, to: ref, launchPosture: attachment.launchPosture, changed, effect, ...(review ? { review } : {}) };
   }
 
+  /**
+   * Stop a managed session, optionally conditioned on a prior review. Checked stops
+   * revalidate before destructive tmux commands and report uncertain or partial effects.
+   */
   async stopSeat(input: { seatRef: string; reason: string; operator?: string | null; expected?: SeatReview }): Promise<StopSeatResult> {
     if (input.expected !== undefined && !validSeatReview(input.expected)) return { ok: false, code: "invalid_review", message: "Invalid seat review token." };
     const required = this.requireReason(input.reason);

@@ -183,6 +183,35 @@ describe("checked seat selection", () => {
     expect(killed).toEqual([]);
   });
 
+  it("audits a checked Codex policy reaffirmation once and rejects a stale one without effects", async () => {
+    const s = seat();
+    const first = await service.setPolicy({ seatRef: s.ref, ref: "none", reason: "initial choice", actor: "op", expected: s.descriptor.review });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const policyWrites = vi.spyOn(repo, "setNodePermissionPolicy");
+    const provenanceWrites = vi.spyOn(repo, "setNodePolicyProvenance");
+
+    const reaffirmed = await service.setPolicy({ seatRef: s.ref, ref: "none", reason: "use this on rebuild", actor: "op", expected: first.review });
+    expect(reaffirmed.ok).toBe(true);
+    if (!reaffirmed.ok) return;
+    expect(reaffirmed).toMatchObject({ changed: false, from: "none", to: "none" });
+    expect(reaffirmed.review).toEqual(readSeatReview(db, s.node.id)!.review);
+    expect(policyWrites).toHaveBeenCalledTimes(1);
+    expect(provenanceWrites).toHaveBeenCalledTimes(1);
+    const events = db.prepare("SELECT payload FROM events WHERE type = 'node.policy_changed' ORDER BY seq").all() as { payload: string }[];
+    expect(events).toHaveLength(2);
+    expect(JSON.parse(events[1]!.payload)).toMatchObject({ nodeId: s.node.id, from: "none", to: "none", reason: "use this on rebuild", operator: "op" });
+
+    sessions.updateResumeToken(s.session.id, "codex_thread_id", "changed-after-review", "hook");
+    const before = db.prepare("SELECT permission_policy, policy_origin, policy_launch_posture FROM nodes WHERE id = ?").get(s.node.id);
+    const stale = await service.setPolicy({ seatRef: s.ref, ref: "none", reason: "stale reaffirmation", actor: "op", expected: reaffirmed.review });
+    expect(stale.ok ? "ok" : stale.code).toBe("selection_changed");
+    expect(db.prepare("SELECT permission_policy, policy_origin, policy_launch_posture FROM nodes WHERE id = ?").get(s.node.id)).toEqual(before);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'node.policy_changed'").get()).toEqual({ n: 2 });
+    expect(policyWrites).toHaveBeenCalledTimes(1);
+    expect(provenanceWrites).toHaveBeenCalledTimes(1);
+  });
+
   it("does not let a recycled human seat reference select a replacement node", async () => {
     const s = seat();
     db.prepare("DELETE FROM nodes WHERE id = ?").run(s.node.id);

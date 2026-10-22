@@ -675,16 +675,21 @@ describe("Codex runtime adapter", () => {
     }
   });
 
-  it("honors a closer read-only project layer over a writable ancestor", async () => {
+  it("keeps generated roots when an untrusted read-only child can leave a writable parent active", async () => {
     const codexHome = "/private/codex";
-    const resolveGitAddDirs = vi.fn(async () => ["/project/.git"]);
+    const userPath = `${codexHome}/config.toml`;
+    const userContent = '[projects."/project"]\ntrust_level = "trusted"\n[projects."/project/src"]\ntrust_level = "untrusted"\n';
+    const fsOps = mockFs({
+      [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+      [userPath]: userContent,
+      "/project/.codex/config.toml": 'sandbox_mode = "workspace-write"\n',
+      "/project/src/.codex/config.toml": 'sandbox_mode = "read-only"\n',
+    });
+    const writeFile = vi.spyOn(fsOps, "writeFile");
+    const resolveGitAddDirs = vi.fn(async () => ["/outside/repo-metadata"]);
     const tmux = mockTmux();
     const adapter = new CodexRuntimeAdapter({
-      tmux, codexHome, fsOps: mockFs({
-        [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
-        "/project/.codex/config.toml": 'sandbox_mode = "workspace-write"\n',
-        "/project/src/.codex/config.toml": 'sandbox_mode = "read-only"\n',
-      }),
+      tmux, codexHome, fsOps,
       resolveGitAddDirs, listProcesses: () => [], sleep: async () => {},
       verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
     });
@@ -692,8 +697,12 @@ describe("Codex runtime adapter", () => {
     const result = await adapter.launchHarness({ ...makeBinding("/project/src"), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
 
     expect(result.ok).toBe(true);
-    expect(vi.mocked(tmux.sendText).mock.calls[0]?.[1]).not.toContain("--add-dir");
-    expect(resolveGitAddDirs).not.toHaveBeenCalled();
+    const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+    expect(command).toContain("--add-dir '/outside/repo-metadata'");
+    expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+    expect(resolveGitAddDirs).toHaveBeenCalled();
+    expect(fsOps.readFile(userPath)).toBe(userContent);
+    expect(writeFile).not.toHaveBeenCalledWith(userPath, expect.anything());
   });
 
   it("keeps generated writable roots for writable, absent and unreadable profiles, and an overriding posture", async () => {

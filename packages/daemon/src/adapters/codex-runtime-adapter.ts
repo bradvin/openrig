@@ -823,7 +823,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return root ? ` --add-dir ${shellQuote(root)}` : "";
   }
 
-  /** Suppress roots only when the selected profile remains read-only after visible config layers. */
+  /** Suppress roots only when no visible config layer might make the profile writable. */
   private profileRemainsReadOnly(profile: string, cwd: string): boolean {
     const root = this.codexHome ?? nodePath.join(this.fs.homedir ?? os.homedir(), ".codex");
     const path = nodePath.join(root, `${profile}.config.toml`);
@@ -835,19 +835,18 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       // Codex can select a named permission profile independently of the legacy
       // sandbox setting, even when that setting came from a higher-priority profile.
       if (this.fs.exists(userPath) && parseToml(this.fs.readFile(userPath)).default_permissions !== undefined) return false;
-      // Codex loads trusted project config from the project root toward cwd. Search
-      // every ancestor: an extra file above its chosen root only keeps the old roots.
-      let closestProjectSandbox: unknown;
+      // Trust can exclude a closer project file, leaving a writable ancestor active.
+      // Keep roots if any visible ancestor could make the launch writable.
       for (let dir = nodePath.normalize(cwd);;) {
         const projectPath = nodePath.join(dir, ".codex", "config.toml");
         // At the home ancestor this is the user config, which loaded before the profile.
         if (projectPath !== userPath && this.fs.exists(projectPath)) {
           const project = parseToml(this.fs.readFile(projectPath));
           if (project.default_permissions !== undefined) return false;
-          if (closestProjectSandbox === undefined && project.sandbox_mode !== undefined) closestProjectSandbox = project.sandbox_mode;
+          if (project.sandbox_mode !== undefined && project.sandbox_mode !== "read-only") return false;
         }
         const parent = nodePath.dirname(dir);
-        if (parent === dir) return closestProjectSandbox === undefined || closestProjectSandbox === "read-only";
+        if (parent === dir) return true;
         dir = parent;
       }
     } catch {

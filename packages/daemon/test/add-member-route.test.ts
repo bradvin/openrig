@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import type { ExpansionRequest } from "../src/domain/types.js";
@@ -57,6 +58,38 @@ describe("POST /api/rigs/:rigId/pods/:podNamespace/members", () => {
     // The new node is in the live rig under the existing pod.
     const updatedRig = setup.rigRepo.getRig(rig.id)!;
     expect(updatedRig.nodes.some((n) => n.logicalId === "infra.server2")).toBe(true);
+  });
+
+  it("records member materialization and launch outcome for an operation ID", async () => {
+    const rig = await seedRigWithPod();
+    const id = randomUUID();
+    const request = (memberId: string) => setup.app.request(`/api/rigs/${rig.id}/pods/infra/members`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Operation-Id": id },
+      body: JSON.stringify({ member: terminalMember(memberId), rigRoot: "." }),
+    });
+    const first = await request("newseat");
+    expect(first.status).toBe(201);
+    const body = await first.json();
+    expect(body.operation).toMatchObject({ state: "completed", effect: "committed",
+      target: { rigId: rig.id, nodeIds: [body.result.result.node.nodeId] }, external: "completed" });
+    expect(body.operation.effects.map((step: { step: string }) => step.step))
+      .toEqual(expect.arrayContaining(["member:infra.newseat", "launch:infra.newseat",
+        "config:restore:infra.newseat"]));
+    expect((await request("newseat")).status).toBe(200);
+    expect((await request("another")).status).toBe(409);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE rig_id = ? AND logical_id = ?")
+      .get(rig.id, "infra.newseat")).toEqual({ n: 1 });
+  });
+
+  it("rejects a present empty operation ID without adding a member", async () => {
+    const rig = await seedRigWithPod();
+    const res = await setup.app.request(`/api/rigs/${rig.id}/pods/infra/members`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Operation-Id": "" },
+      body: JSON.stringify({ member: terminalMember("never"), rigRoot: "." }),
+    });
+    expect(res.status).toBe(400);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE rig_id = ? AND logical_id = ?")
+      .get(rig.id, "infra.never")).toEqual({ n: 0 });
   });
 
   it("returns 404 for a nonexistent rig", async () => {

@@ -1,4 +1,4 @@
-/** Public shape of a durable operation receipt. The implementation is not yet exposed by HTTP. */
+/** Public shape of a durable operation receipt. */
 export type OperationKind = "rig.create" | "rig.import" | "rig.materialize" | "member.add";
 export type OperationState = "running" | "completed" | "interrupted";
 export type OperationEffect = "none" | "committed" | "partial" | "rolled_back" | "unknown";
@@ -16,6 +16,8 @@ export interface OperationStep {
   kind: string;
   targetId?: string;
   state: OperationStepState;
+  externalOutcome?: "completed" | "incomplete" | "indeterminate";
+  evidence?: { ids?: string[]; referenceIds?: string[] };
 }
 
 export interface OperationReceipt {

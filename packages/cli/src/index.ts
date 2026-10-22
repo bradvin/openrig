@@ -60,6 +60,7 @@ import { doctorCommand } from "./commands/doctor.js";
 import { expandCommand } from "./commands/expand.js";
 import { addMemberCommand } from "./commands/add.js";
 import { createCommand } from "./commands/create.js";
+import { operationCommand } from "./commands/operation.js";
 import { growCommand } from "./commands/grow.js";
 import { edgeCommand } from "./commands/edge.js";
 import { reconcileSessionCommand } from "./commands/reconcile-session.js";
@@ -242,6 +243,7 @@ export function createProgram(depsOverride?: ProgramDeps): Command {
   program.addCommand(expandCommand(depsOverride?.expandDeps));
   program.addCommand(addMemberCommand(depsOverride?.addDeps));
   program.addCommand(createCommand(depsOverride?.createDeps));
+  program.addCommand(operationCommand(depsOverride?.createDeps));
   program.addCommand(growCommand(depsOverride?.growDeps));
   program.addCommand(edgeCommand(depsOverride?.edgeDeps));
   program.addCommand(reconcileSessionCommand(depsOverride?.reconcileSessionDeps));

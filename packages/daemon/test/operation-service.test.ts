@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { migrate } from "../src/db/migrate.js";
@@ -9,7 +10,8 @@ import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { operationReceiptsSchema } from "../src/db/migrations/126_operation_receipts.js";
 import { OperationRepository } from "../src/domain/operation-repository.js";
 import { OperationService, normalizedOperationRoot, operationRequestHash, parseOperationYaml } from "../src/domain/operation-service.js";
-import { validateOperationPublicResult } from "../src/domain/operation-public-result.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { operationValidationFields, validateOperationPublicResult } from "../src/domain/operation-public-result.js";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -37,13 +39,169 @@ function request(operationId = randomUUID(), extras: Record<string, unknown> = {
 }
 
 describe("operation receipt foundation", () => {
+  it("survives a hard child-process death after a committed effect and external intent", () => {
+    const { db, path } = database();
+    db.close();
+    const id = randomUUID();
+    const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+      import Database from "better-sqlite3";
+      import { OperationRepository } from "./packages/daemon/src/domain/operation-repository.ts";
+      import { OperationService } from "./packages/daemon/src/domain/operation-service.ts";
+      const db = new Database(process.argv[1]);
+      const ops = new OperationService(new OperationRepository(db));
+      const id = process.argv[2];
+      ops.reserve({ operationId: id, kind: "rig.import", targetIds: {}, payload: { name: "crash" },
+        options: {}, expectsExternal: true });
+      db.transaction(() => {
+        db.prepare("INSERT INTO owned_effects VALUES ('rig-crash')").run();
+        ops.commitEffectWithinTransaction({ operationId: id, step: "rig", kind: "topology.rig",
+          targetId: "rig-crash", target: { rigId: "rig-crash", nodeIds: [] },
+          effect: "committed", phase: "materialized" });
+      }).immediate();
+      ops.beginExternalStep({ operationId: id, step: "launch:lead", kind: "external.launch",
+        phase: "launching" });
+      process.kill(process.pid, "SIGKILL");
+    `, path, id], { cwd: process.cwd(), env: { ...process.env, HOME: dirs[dirs.length - 1],
+      OPENRIG_HOME: dirs[dirs.length - 1] }, encoding: "utf8", timeout: 15_000 });
+    expect(child.signal).toBe("SIGKILL");
+    const reopened = new Database(path);
+    try {
+      expect(reopened.prepare("SELECT id FROM owned_effects").all()).toEqual([{ id: "rig-crash" }]);
+      const next = service(reopened);
+      expect(next.recoverInterrupted()).toBe(1);
+      expect(next.read(id)).toMatchObject({ state: "interrupted", effect: "committed",
+        external: "indeterminate", target: { rigId: "rig-crash" },
+        effects: [{ step: "rig", state: "committed" }, { step: "launch:lead", state: "intent" }] });
+      expect(next.reserve({ operationId: id, kind: "rig.import", targetIds: {}, payload: { name: "crash" },
+        options: {}, expectsExternal: true }).kind).toBe("replayed");
+    } finally { reopened.close(); }
+  });
+  it.each(["archive_create", "member_commit", "external_outcome", "compensation", "terminal_result"] as const)(
+    "recovers actual topology and receipt after SIGKILL at %s boundary", (boundary) => {
+      const dir = mkdtempSync(join(tmpdir(), `openrig-operation-${boundary}-`));
+      dirs.push(dir);
+      const path = join(dir, "topology.sqlite");
+      const initial = new Database(path);
+      migrate(initial, ALL_MIGRATIONS);
+      let priorId: string | undefined;
+      if (boundary === "archive_create" || boundary === "compensation") {
+        priorId = new RigRepository(initial).createRig("replacement-name").id;
+      }
+      initial.close();
+      const id = randomUUID();
+      const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+        import Database from "better-sqlite3";
+        import { RigRepository } from "./packages/daemon/src/domain/rig-repository.ts";
+        import { PodRepository } from "./packages/daemon/src/domain/pod-repository.ts";
+        import { OperationRepository } from "./packages/daemon/src/domain/operation-repository.ts";
+        import { OperationService } from "./packages/daemon/src/domain/operation-service.ts";
+        const db = new Database(process.argv[1]);
+        db.pragma("foreign_keys = ON");
+        const id = process.argv[2], boundary = process.argv[3], priorId = process.argv[4];
+        const rigs = new RigRepository(db), pods = new PodRepository(db);
+        const ops = new OperationService(new OperationRepository(db));
+        ops.reserve({ operationId: id, kind: "rig.import", targetIds: {},
+          payload: { name: "replacement-name" }, options: {}, expectsExternal: true });
+        let rigId;
+        db.transaction(() => {
+          if (boundary === "archive_create" || boundary === "compensation") {
+            if (!rigs.archiveRig(priorId)) throw new Error("archive failed");
+            ops.commitEffectWithinTransaction({ operationId: id, step: "archive:" + priorId,
+              kind: "topology.archive", targetId: priorId,
+              target: { nodeIds: [] }, effect: "partial", phase: "archiving" });
+          }
+          const rig = rigs.createRig("replacement-name"); rigId = rig.id;
+          ops.commitEffectWithinTransaction({ operationId: id, step: "rig", kind: "topology.rig",
+            targetId: rigId, target: { rigId, nodeIds: [] }, effect: "committed", phase: "created" });
+        }).immediate();
+        if (boundary === "member_commit" || boundary === "external_outcome") {
+          db.transaction(() => {
+            const pod = pods.createPod(rigId, "desk", "Desk");
+            ops.commitEffectWithinTransaction({ operationId: id, step: "pod:desk", kind: "topology.pod",
+              targetId: pod.id, target: { rigId, podId: pod.id, nodeIds: [] },
+              effect: "committed", phase: "creating_pods" });
+            const node = rigs.addNode(rigId, "desk.lead", { runtime: "terminal", podId: pod.id });
+            ops.commitEffectWithinTransaction({ operationId: id, step: "member:desk.lead", kind: "topology.member",
+              targetId: node.id, target: { rigId, podId: pod.id, nodeIds: [node.id] },
+              effect: "committed", phase: "creating_members" });
+          }).immediate();
+        }
+        if (boundary === "external_outcome") {
+          ops.beginExternalStep({ operationId: id, step: "launch:desk.lead", kind: "external.launch",
+            phase: "launching" });
+          ops.finishExternalStep({ operationId: id, step: "launch:desk.lead", state: "observed",
+            external: "completed", phase: "launched" });
+        }
+        if (boundary === "compensation") {
+          db.transaction(() => {
+            rigs.deleteRig(rigId);
+            rigs.unarchiveRig(priorId);
+            ops.commitEffectWithinTransaction({ operationId: id, step: "archive:" + priorId,
+              kind: "topology.archive", targetId: priorId, state: "compensated",
+              target: { nodeIds: [] }, effect: "partial", phase: "compensating" });
+            ops.commitEffectWithinTransaction({ operationId: id, step: "rig", kind: "topology.rig",
+              targetId: rigId, state: "compensated", target: { nodeIds: [] },
+              effect: "rolled_back", phase: "compensated" });
+          }).immediate();
+        }
+        if (boundary === "terminal_result") {
+          db.transaction(() => {
+            const current = ops.read(id);
+            ops.completeWithinTransaction({ operationId: id, phase: "completed", target: current.target,
+              effect: current.effect, external: current.external, httpStatus: 201,
+              result: { rigId, specName: "replacement-name", nodes: [] } });
+          }).immediate();
+        }
+        process.kill(process.pid, "SIGKILL");
+      `, path, id, boundary, priorId ?? ""], { cwd: process.cwd(), env: { ...process.env,
+        HOME: dir, OPENRIG_HOME: dir }, encoding: "utf8", timeout: 20_000 });
+      expect(child.signal, child.stderr || child.stdout).toBe("SIGKILL");
+      const reopened = new Database(path);
+      try {
+        const next = service(reopened);
+        expect(next.recoverInterrupted()).toBe(boundary === "terminal_result" ? 0 : 1);
+        const receipt = next.read(id)!;
+        expect(receipt.state).toBe(boundary === "terminal_result" ? "completed" : "interrupted");
+        expect(next.reserve({ operationId: id, kind: "rig.import", targetIds: {},
+          payload: { name: "replacement-name" }, options: {}, expectsExternal: true }).kind).toBe("replayed");
+        const rows = reopened.prepare("SELECT id, archived_at FROM rigs WHERE name = ?").all("replacement-name") as
+          Array<{ id: string; archived_at: string | null }>;
+        if (boundary === "compensation") {
+          expect(rows).toEqual([{ id: priorId, archived_at: null }]);
+          expect(receipt.effect).toBe("rolled_back");
+          expect(receipt.effects.every((effect) => effect.state === "compensated")).toBe(true);
+        } else if (boundary === "archive_create") {
+          expect(rows).toHaveLength(2);
+          expect(rows.find((row) => row.id === priorId)?.archived_at).not.toBeNull();
+          expect(receipt.effects.map((effect) => effect.step)).toEqual(expect.arrayContaining(["rig", `archive:${priorId}`]));
+        } else {
+          expect(rows).toHaveLength(1);
+        }
+        if (boundary === "member_commit" || boundary === "external_outcome") {
+          expect(reopened.prepare("SELECT COUNT(*) AS n FROM nodes WHERE rig_id = ?").get(receipt.target.rigId))
+            .toEqual({ n: 1 });
+          expect(receipt.target.nodeIds).toHaveLength(1);
+        }
+        if (boundary === "external_outcome") {
+          expect(receipt.external).toBe("completed");
+          expect(receipt.effects.find((effect) => effect.step === "launch:desk.lead"))
+            .toMatchObject({ state: "observed", externalOutcome: "completed" });
+        }
+        if (boundary === "terminal_result") {
+          expect(receipt).toMatchObject({ originalHttpStatus: 201,
+            result: { rigId: rows[0]!.id, specName: "replacement-name" } });
+        }
+      } finally { reopened.close(); }
+    },
+  );
   it("accepts only bounded, kind-specific public result fields", () => {
     expect(validateOperationPublicResult("rig.create", { id: "rig-1", name: "A" }))
       .toEqual({ id: "rig-1", name: "A" });
     expect(validateOperationPublicResult("rig.materialize", { rigId: "rig-1",
       nodes: [{ logicalId: "lead", status: "materialized" }] })).toMatchObject({ rigId: "rig-1" });
-    expect(validateOperationPublicResult("member.add", { podId: "pod-1", podNamespace: "desk",
-      node: { logicalId: "ui", nodeId: "node-1", status: "launched" }, edges: [] })).toMatchObject({ podId: "pod-1" });
+    expect(validateOperationPublicResult("member.add", { ok: true, result: { podId: "pod-1", podNamespace: "desk",
+      node: { logicalId: "ui", nodeId: "node-1", status: "launched" }, edges: [] } }))
+      .toMatchObject({ ok: true, result: { podId: "pod-1" } });
     for (const unsafe of [{ token: "raw-native-token" }, { env: { API_KEY: "x" } },
       { rigId: "rig-1", transcript: "private" }, { rigId: "rig-1", rawSpec: "name: A" }]) {
       expect(() => validateOperationPublicResult("rig.import", unsafe)).toThrow("unrecognized");
@@ -54,6 +212,16 @@ describe("operation receipt foundation", () => {
       nodes: [{ logicalId: "lead", status: "launched" }] })).toThrow("status");
     expect(() => validateOperationPublicResult("rig.import", { rigId: "rig-1", nodes: Array(257).fill({
       logicalId: "lead", status: "launched" }) })).toThrow("array");
+    const fields = operationValidationFields([
+      "pods[0].members[1].runtime: unsupported value secret-runtime-token",
+      "env.API_KEY: invalid value pg_secret",
+      "unknown_private_key: unknown key secret-token",
+    ]);
+    expect(fields).toEqual(["pods[0].members[1].runtime: invalid", "request: invalid"]);
+    expect(validateOperationPublicResult("rig.import", { code: "validation_failed", errors: fields }))
+      .toEqual({ code: "validation_failed", errors: fields });
+    expect(() => validateOperationPublicResult("rig.import", { code: "validation_failed",
+      errors: ["env.API_KEY: invalid"] })).toThrow("validation_field");
   });
   it("hashes parsed YAML by stable keys, preserving arrays and behavior options", () => {
     const a = { kind: "rig.import" as const, targetIds: {},

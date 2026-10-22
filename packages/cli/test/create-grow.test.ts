@@ -65,6 +65,57 @@ const library = [{
 afterEach(() => vi.restoreAllMocks());
 
 describe("rig create", () => {
+  it("sends an operation ID and reads the wrapped result", async () => {
+    const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
+    const client = {
+      get: vi.fn(async (path: string) => path === "/api/operations/capabilities"
+        ? { status: 200, data: { contract: "operations.v1", kinds: ["rig.import"] } }
+        : { status: 200, data: library }),
+      postText: vi.fn(async () => ({ status: 201, data: {
+        operation: { operationId: id, state: "completed", effect: "committed" },
+        result: { rigId: "rig-1", specName: "alpha", specVersion: "0.2",
+          nodes: [{ logicalId: "main.lead", status: "launched" }] },
+      } })),
+    };
+    const program = createProgram({ createDeps: deps(client) });
+    program.exitOverride();
+    const output = await captureLogs(() => program.parseAsync([
+      "node", "rig", "create", "alpha", "--cwd", "/work", "--operation-id", id, "--json",
+    ]));
+    expect(output.exitCode).toBeUndefined();
+    expect(client.get).toHaveBeenCalledWith("/api/operations/capabilities");
+    expect(client.postText).toHaveBeenCalledWith("/api/rigs/import", expect.any(String), "text/yaml",
+      { "X-Rig-Root": "/work", "X-Cwd-Override": "/work", "X-OpenRig-Operation-Id": id },
+      { timeoutMs: 120_000 });
+    expect(JSON.parse(output.logs.join("\n"))).toMatchObject({ ok: true, operationId: id, rigId: "rig-1" });
+  });
+  it.each(["running", "interrupted"])("reports %s receipt without a result as incomplete JSON and exits nonzero", async (state) => {
+    const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
+    const client = { get: vi.fn(async (path: string) => path === "/api/operations/capabilities"
+      ? { status: 200, data: { contract: "operations.v1", kinds: ["rig.import"] } }
+      : { status: 200, data: library }),
+    postText: vi.fn(async () => ({ status: state === "running" ? 202 : 200,
+      data: { operation: { operationId: id, state, effect: "none" } } })) };
+    const program = createProgram({ createDeps: deps(client) });
+    program.exitOverride();
+    const output = await captureLogs(() => program.parseAsync(["node", "rig", "create", "alpha",
+      "--cwd", "/work", "--operation-id", id, "--json"]));
+    expect(output.exitCode).toBe(1);
+    expect(JSON.parse(output.logs.join("\n"))).toMatchObject({ ok: false,
+      operation: { operationId: id, state } });
+  });
+  it("refuses an operation ID when the daemon lacks the capability", async () => {
+    const client = { get: vi.fn(async () => ({ status: 404, data: { error: "not_found" } })),
+      postText: vi.fn() };
+    const program = createProgram({ createDeps: deps(client) });
+    program.exitOverride();
+    const output = await captureLogs(() => program.parseAsync([
+      "node", "rig", "create", "alpha", "--operation-id", "ea7e6a21-b25b-41e2-947e-8554d086ef2a",
+    ]));
+    expect(output.exitCode).toBe(1);
+    expect(output.logs.join("\n")).toContain("does not advertise operations.v1");
+    expect(client.postText).not.toHaveBeenCalled();
+  });
   it("creates one launched seat from the shipped agent without user-authored YAML", async () => {
     let sentYaml = "";
     let sentHeaders: Record<string, string> | undefined;

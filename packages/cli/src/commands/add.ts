@@ -7,6 +7,7 @@ import { resolveRigHandle } from "../rig-handle.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+import { operationResult, requireOperationCapability } from "./operation.js";
 
 interface AddMemberResponse {
   ok: boolean;
@@ -45,7 +46,8 @@ Examples:
     .argument("<member-fragment-path>", "Path to YAML/JSON member fragment file (spec snake_case fields)")
     .option("--json", "JSON output for agents")
     .option("--rig-root <path>", "Root directory for agent resolution")
-    .action(async (rigHandle: string, podNamespace: string, fragmentPath: string, opts: { json?: boolean; rigRoot?: string }) => {
+    .option("--operation-id <uuid>", "Durable retry identity for this member addition")
+    .action(async (rigHandle: string, podNamespace: string, fragmentPath: string, opts: { json?: boolean; rigRoot?: string; operationId?: string }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
       if (!daemonStatusGuard(status)) return;
@@ -95,6 +97,7 @@ Examples:
       if (opts.rigRoot) body["rigRoot"] = opts.rigRoot;
 
       const client = deps.clientFactory(getDaemonUrl(status));
+      if (opts.operationId !== undefined && !await requireOperationCapability(client, "member.add")) return;
 
       const refuse = (error: Record<string, unknown> & { message: string }) => {
         if (opts.json) console.log(JSON.stringify({ ok: false, ...error }, null, 2));
@@ -135,26 +138,30 @@ Examples:
       const res = await client.post<AddMemberResponse>(
         `/api/rigs/${encodeURIComponent(rigId)}/pods/${encodeURIComponent(podNamespace)}/members`,
         body,
-        { timeoutMs: 120_000 },
+        { timeoutMs: 120_000,
+          ...(opts.operationId !== undefined ? { headers: { "X-OpenRig-Operation-Id": opts.operationId } } : {}) },
       );
-      const data = res.data;
+      const received = operationResult(res.data, res.status, opts.operationId, opts.json);
+      if (received === undefined) return;
+      const data = received.value;
 
       if (opts.json) {
         console.log(JSON.stringify(data, null, 2));
         // Non-zero if the HTTP failed OR the new node did not fully launch.
-        if (res.status >= 400 || (data.ok && data.result !== undefined && data.result.node.status !== "launched")) {
+        if (received.status >= 400 || !data.ok || (data.result !== undefined && data.result.node.status !== "launched")) {
           process.exitCode = 1;
         }
         return;
       }
 
-      if (res.status >= 400 || !data.ok) {
+      if (received.status >= 400 || !data.ok) {
         // Honest 3-part error: the daemon's message already says what failed /
         // why / what to do (pod_not_found lists pods; member_conflict suggests a
         // new id); validation/preflight surface the specific field errors.
         const msg = data.message
           ?? (data.errors && data.errors.length > 0 ? data.errors.join("; ") : data.error)
-          ?? `Add member failed (HTTP ${res.status})`;
+          ?? data.code
+          ?? `Add member failed (HTTP ${received.status})`;
         console.error(msg);
         if (resolution.kind === "passthrough" && data.code === "rig_not_found") {
           console.error("Could not list rigs to resolve a name. If this is a rig name, pass the rig id instead (rig ps --json).");

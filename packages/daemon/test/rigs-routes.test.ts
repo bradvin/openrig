@@ -8,6 +8,7 @@ import type { SnapshotCapture } from "../src/domain/snapshot-capture.js";
 import type { RestoreOrchestrator } from "../src/domain/restore-orchestrator.js";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
+import { randomUUID } from "node:crypto";
 
 function insertStartupContextRow(db: Database.Database, nodeId: string) {
   db.prepare(
@@ -50,6 +51,61 @@ describe("Rig CRUD routes", () => {
     const body = await res.json();
     expect(body.id).toBeDefined();
     expect(body.name).toBe("test-rig");
+  });
+
+  it("records a bare create atomically and replays a lost response without another rig", async () => {
+    const id = randomUUID();
+    const request = (name: string) => app.request("/api/rigs", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Operation-Id": id },
+      body: JSON.stringify({ name }) });
+    const first = await request("receipt-rig");
+    expect(first.status).toBe(201);
+    const created = await first.json();
+    expect(created.operation).toMatchObject({ operationId: id, state: "completed", effect: "committed",
+      originalHttpStatus: 201, target: { rigId: created.result.id, nodeIds: [] } });
+    expect(created.result.name).toBe("receipt-rig");
+    const replay = await request("receipt-rig");
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ replayed: true, result: { id: created.result.id } });
+    const lookup = await app.request(`/api/operations/${id}`);
+    expect(lookup.status).toBe(200);
+    expect(await lookup.json()).toMatchObject({ operation: { operationId: id },
+      result: { id: created.result.id, name: "receipt-rig" } });
+    expect((await request("changed")).status).toBe(409);
+    expect(repo.listRigs().filter((rig) => rig.name === "receipt-rig")).toHaveLength(1);
+  });
+
+  it("advertises the complete operation kinds and keeps lookup separate", async () => {
+    const capabilities = await app.request("/api/operations/capabilities");
+    expect(capabilities.status).toBe(200);
+    expect(await capabilities.json()).toEqual({ contract: "operations.v1",
+      kinds: ["rig.create", "rig.import", "rig.materialize", "member.add"] });
+    expect((await app.request(`/api/operations/${randomUUID()}`)).status).toBe(404);
+  });
+
+  it("rejects a present empty operation ID before bare create", async () => {
+    const res = await app.request("/api/rigs", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Operation-Id": "" },
+      body: JSON.stringify({ name: "must-not-exist" }) });
+    expect(res.status).toBe(400);
+    expect(repo.listRigs()).toHaveLength(0);
+  });
+
+  it("terminalizes a same-boot create failure so the ID cannot re-execute", async () => {
+    const id = randomUUID();
+    vi.spyOn(repo, "createRig").mockImplementationOnce(() => { throw new Error("injected create fault"); });
+    const request = () => app.request("/api/rigs", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Operation-Id": id },
+      body: JSON.stringify({ name: "failed-create" }) });
+    const first = await request();
+    expect(first.status).toBe(500);
+    expect(await first.json()).toMatchObject({ operation: { operationId: id, state: "completed",
+      effect: "none", originalHttpStatus: 500 }, result: { code: "operation_failed" } });
+    const replay = await request();
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ replayed: true, operation: { operationId: id,
+      state: "completed", effect: "none" } });
+    expect(repo.listRigs()).toHaveLength(0);
   });
 
   it("GET /api/rigs -> list of rigs", async () => {

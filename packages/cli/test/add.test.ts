@@ -103,11 +103,15 @@ describe("rig add", () => {
   let fragmentPath: string;
   let capturedBody: Record<string, unknown> | null = null;
   let capturedUrl: string | null = null;
+  let capturedOperationId: string | undefined;
   let summaryStatus = 200;
 
   beforeAll(async () => {
     server = http.createServer((req, res) => {
-      if (req.method === "GET" && req.url?.startsWith("/api/rigs/summary")) {
+      if (req.method === "GET" && req.url === "/api/operations/capabilities") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ contract: "operations.v1", kinds: ["member.add"] }));
+      } else if (req.method === "GET" && req.url?.startsWith("/api/rigs/summary")) {
         res.writeHead(summaryStatus, { "Content-Type": "application/json" });
         // Mirrors the route: archived rigs only with ?includeArchived=true.
         const includeArchived = new URL(req.url, "http://x").searchParams.get("includeArchived") === "true";
@@ -115,6 +119,7 @@ describe("rig add", () => {
         res.end(JSON.stringify(summaryStatus === 200 ? rigs : { error: "unavailable" }));
       } else if (req.method === "POST" && req.url?.includes("/members")) {
         capturedUrl = req.url;
+        capturedOperationId = req.headers["x-openrig-operation-id"] as string | undefined;
         let body = "";
         req.on("data", (chunk) => { body += chunk; });
         req.on("end", () => {
@@ -135,7 +140,14 @@ describe("rig add", () => {
             res.end(JSON.stringify(FAILED_LAUNCH_RESPONSE));
           } else {
             res.writeHead(201, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(OK_RESPONSE));
+            res.end(JSON.stringify(capturedOperationId ? {
+              operation: { operationId: capturedOperationId, state: "completed", effect: "committed" },
+              result: { ok: true, result: { podId: OK_RESPONSE.result.podId,
+                podNamespace: OK_RESPONSE.result.podNamespace, node: {
+                  logicalId: OK_RESPONSE.result.node.logicalId,
+                  nodeId: OK_RESPONSE.result.node.nodeId, status: OK_RESPONSE.result.node.status },
+                edges: [] } },
+            } : OK_RESPONSE));
           }
         });
       } else {
@@ -154,6 +166,7 @@ describe("rig add", () => {
   beforeEach(() => {
     capturedBody = null;
     capturedUrl = null;
+    capturedOperationId = undefined;
     summaryStatus = 200;
     // Hermetic host selection: never read the real ~/.openrig/config.json.
     savedHostSelected = process.env["OPENRIG_HOST_SELECTED"];
@@ -209,6 +222,49 @@ describe("rig add", () => {
     const parsed = JSON.parse(logs.join("\n"));
     expect(parsed.ok).toBe(true);
     expect(parsed.result.node.logicalId).toBe("infra.server2");
+  });
+
+  it("sends --operation-id and handles the receipt's bounded member result", async () => {
+    const id = "14e07638-8dc1-4827-a6a8-fb879899054b";
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "add", "rig-123", "infra", fragmentPath,
+        "--operation-id", id]);
+    });
+    expect(capturedOperationId).toBe(id);
+    expect(logs.join("\n")).toContain("[OK] infra.server2");
+    expect(exitCode).toBeUndefined();
+  });
+
+  it.each(["failed", "running", "interrupted"])("--json reports a %s operation receipt with a nonzero exit", async (state) => {
+    const id = "14e07638-8dc1-4827-a6a8-fb879899054b";
+    const client = {
+      get: vi.fn(async (path: string) => path === "/api/operations/capabilities"
+        ? { status: 200, data: { contract: "operations.v1", kinds: ["member.add"] } }
+        : { status: 200, data: [{ id: "rig-123", name: "test" }] }),
+      post: vi.fn(async () => ({ status: state === "running" ? 202 : 200,
+        data: { replayed: state === "failed", operation: { operationId: id,
+          state: state === "failed" ? "completed" : state, effect: "none",
+          ...(state === "failed" ? { originalHttpStatus: 409 } : {}) },
+        ...(state === "failed" ? { result: { ok: false, code: "member_conflict" } } : {}) } })),
+    };
+    const command = makeCmd({ ...runningDeps(), clientFactory: () => client as unknown as DaemonClient });
+    const { logs, exitCode } = await captureLogs(() => command.parseAsync(["node", "rig", "add",
+      "rig-123", "infra", fragmentPath, "--operation-id", id, "--json"]));
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(logs.join("\n"))).toMatchObject(state === "failed"
+      ? { ok: false, code: "member_conflict" }
+      : { ok: false, operation: { operationId: id, state } });
+  });
+
+  it("refuses --operation-id when the selected daemon returns no capability", async () => {
+    const client = { get: vi.fn(async () => ({ status: 404, data: { error: "not_found" } })),
+      post: vi.fn() };
+    const command = makeCmd({ ...runningDeps(), clientFactory: () => client as unknown as DaemonClient });
+    const { logs, exitCode } = await captureLogs(() => command.parseAsync(["node", "rig", "add",
+      "rig-123", "infra", fragmentPath, "--operation-id", "14e07638-8dc1-4827-a6a8-fb879899054b"]));
+    expect(exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("does not advertise operations.v1");
+    expect(client.post).not.toHaveBeenCalled();
   });
 
   it("human output shows the launched member with its session", async () => {

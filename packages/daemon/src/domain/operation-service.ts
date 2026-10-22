@@ -21,6 +21,12 @@ export interface OperationRequest {
   expectsExternal?: boolean;
 }
 
+/** Passed only by operation-bearing callers to the actual mutation owner. */
+export interface OperationContext {
+  service: OperationService;
+  operationId: string;
+}
+
 export type Reservation =
   | { kind: "reserved"; receipt: OperationReceipt }
   | { kind: "in_flight" | "replayed" | "conflict"; receipt: OperationReceipt };

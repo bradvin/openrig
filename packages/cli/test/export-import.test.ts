@@ -232,6 +232,75 @@ describe("rig export + import", () => {
     };
   }
 
+  it("import --operation-id refuses a daemon without materialize capability before POST", async () => {
+    const client = { get: vi.fn(async () => ({ status: 200, data: {
+      contract: "operations.v1", kinds: ["rig.import"] } })), postText: vi.fn() };
+    const deps = importDeps("version: \"0.2\"\nname: safe\npods: []\nedges: []\n", {
+      clientFactory: () => client as unknown as DaemonClient,
+    });
+    const program = new Command();
+    program.addCommand(importCommand(deps));
+    const prior = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      const logs = await captureLogs(() => program.parseAsync(["node", "rig", "import", "rig.yaml",
+        "--materialize-only", "--operation-id", "ea7e6a21-b25b-41e2-947e-8554d086ef2a"]));
+      expect(logs.join("\n")).toContain("does not advertise operations.v1");
+      expect(process.exitCode).toBe(1);
+      expect(client.get).toHaveBeenCalledWith("/api/operations/capabilities");
+      expect(client.postText).not.toHaveBeenCalled();
+    } finally { process.exitCode = prior; }
+  });
+
+  it.each(["--instantiate", "--materialize-only"])("import %s verifies capability and forwards the operation ID", async (mode) => {
+    const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
+    const kind = mode === "--instantiate" ? "rig.import" : "rig.materialize";
+    const client = { get: vi.fn(async () => ({ status: 200, data: {
+      contract: "operations.v1", kinds: [kind] } })),
+    postText: vi.fn(async () => ({ status: 201, data: { operation: { operationId: id,
+      state: "completed", effect: "committed" }, result: { rigId: "rig-1",
+      specName: "safe", specVersion: "0.2", nodes: [{ logicalId: "desk.lead",
+        status: mode === "--instantiate" ? "launched" : "materialized" }] } } })) };
+    const deps = importDeps("version: \"0.2\"\nname: safe\npods: []\nedges: []\n", {
+      clientFactory: () => client as unknown as DaemonClient,
+    });
+    const program = new Command();
+    program.addCommand(importCommand(deps));
+    const logs = await captureLogs(() => program.parseAsync(["node", "rig", "import", "rig.yaml", mode,
+      "--operation-id", id]));
+    expect(logs.join("\n")).toContain("rig-1");
+    expect(client.get).toHaveBeenCalledWith("/api/operations/capabilities");
+    expect(client.postText).toHaveBeenCalledWith(
+      mode === "--instantiate" ? "/api/rigs/import" : "/api/rigs/import/materialize",
+      expect.any(String), "text/yaml", expect.objectContaining({ "X-OpenRig-Operation-Id": id }),
+      ...(mode === "--instantiate" ? [{ timeoutMs: 120_000 }] : []),
+    );
+  });
+
+  it.each(["--instantiate", "--materialize-only"])("import %s reports a failed 200 replay without reading absent nodes", async (mode) => {
+    const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
+    const kind = mode === "--instantiate" ? "rig.import" : "rig.materialize";
+    const client = { get: vi.fn(async () => ({ status: 200, data: {
+      contract: "operations.v1", kinds: [kind] } })),
+    postText: vi.fn(async () => ({ status: 200, data: { replayed: true,
+      operation: { operationId: id, state: "completed", effect: "none", originalHttpStatus: 409 },
+      result: { code: "preflight_failed", errors: ["request: invalid"] } } })) };
+    const deps = importDeps("version: \"0.2\"\nname: safe\npods: []\nedges: []\n", {
+      clientFactory: () => client as unknown as DaemonClient,
+    });
+    const program = new Command();
+    program.addCommand(importCommand(deps));
+    const prior = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      const logs = await captureLogs(() => program.parseAsync(["node", "rig", "import", "rig.yaml", mode,
+        "--operation-id", id]));
+      expect(process.exitCode).toBe(1);
+      expect(logs.join("\n")).toContain(mode === "--instantiate" ? "Import failed" : "Materialize failed");
+      expect(logs.join("\n")).toContain("request: invalid");
+    } finally { process.exitCode = prior; }
+  });
+
   // Test 1: export writes YAML to -o path
   it("export: writes YAML to specified path", async () => {
     const writeFile = vi.fn();

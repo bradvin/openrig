@@ -33,6 +33,9 @@ import type { DiscoveryRepository } from "./domain/discovery-repository.js";
 import type { ClaimService } from "./domain/claim-service.js";
 import type { SelfAttachService } from "./domain/self-attach-service.js";
 import { rigsRoutes } from "./routes/rigs.js";
+import { operationRoutes } from "./routes/operations.js";
+import { OperationRepository } from "./domain/operation-repository.js";
+import { OperationService } from "./domain/operation-service.js";
 import { sessionsRoutes, nodesRoutes, sessionAdminRoutes } from "./routes/sessions.js";
 import { adaptersRoutes } from "./routes/adapters.js";
 import { eventsRoute } from "./routes/events.js";
@@ -145,6 +148,7 @@ import { createRouteTimingMiddleware } from "./domain/route-timing-recorder.js";
 import { browserBoundary, type BrowserBoundaryOptions } from "./middleware/browser-boundary.js";
 
 export interface AppDeps {
+  operationService?: OperationService;
   /** Boot-time DB context observations, not a live exclusion guarantee. */
   databaseWarnings?: string[];
   proofSourceWatch?: import("./domain/proof/source-watch.js").ProofSourceWatch;
@@ -497,6 +501,12 @@ export function createApp(deps: AppDeps): Hono {
     throw new Error("createApp: podInstantiator must share the same db handle");
   }
 
+  // A fresh app is a fresh executor. Recover prior-boot reservations before any
+  // route can accept a mutation, including in direct createApp test harnesses.
+  const operationService = deps.operationService ?? new OperationService(new OperationRepository(deps.rigRepo.db));
+  if (operationService.repository.db !== deps.rigRepo.db) throw new Error("createApp: operationService must share the same db handle");
+  if (!deps.operationService) operationService.recoverInterrupted();
+
   const app = new Hono();
   if (deps.requestPhaseObserver) app.use("*", deps.requestPhaseObserver.middleware());
   // A malformed request body is a 400, not the default 500.
@@ -508,6 +518,7 @@ export function createApp(deps: AppDeps): Hono {
   // Inject dependencies into context for all routes
   app.use("*", async (c, next) => {
     c.set("rigRepo" as never, deps.rigRepo);
+    c.set("operationService" as never, operationService);
     c.set("sessionRegistry" as never, deps.sessionRegistry);
     c.set("eventBus" as never, deps.eventBus);
     c.set("nodeLauncher" as never, deps.nodeLauncher);
@@ -729,6 +740,7 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   app.route("/api/rigs", rigsRoutes);
+  app.route("/api/operations", operationRoutes);
   app.route("/api/rigs/:rigId/sessions", sessionsRoutes);
   // Slice 24 — per-rig CMUX workspace launcher.
   app.route("/api/rigs/:rigId/cmux", rigCmuxRoutes);

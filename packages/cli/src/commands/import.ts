@@ -5,6 +5,7 @@ import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+import { operationResult, requireOperationCapability } from "./operation.js";
 
 export interface ImportDeps extends StatusDeps {
   readFile: (path: string) => string;
@@ -29,7 +30,8 @@ export function importCommand(depsOverride?: ImportDeps): Command {
     .option("--target-rig <rigId>", "Target existing rig for materialization or workspace apply")
     .option("--rig-root <root>", "Root directory for pod-aware resolution")
     .option("--cwd <path>", "Override launch/materialization working directory for all members")
-    .action(async (filePath: string, opts: { instantiate?: boolean; materializeOnly?: boolean; workspaceOnly?: boolean; preflight?: boolean; targetRig?: string; rigRoot?: string; cwd?: string }) => {
+    .option("--operation-id <uuid>", "Durable retry identity for --instantiate or --materialize-only")
+    .action(async (filePath: string, opts: { instantiate?: boolean; materializeOnly?: boolean; workspaceOnly?: boolean; preflight?: boolean; targetRig?: string; rigRoot?: string; cwd?: string; operationId?: string }) => {
       const deps = getDeps();
 
       // Read local file first (before daemon check — fail fast on missing file)
@@ -69,6 +71,13 @@ export function importCommand(depsOverride?: ImportDeps): Command {
         process.exitCode = 1;
         return;
       }
+      if (opts.operationId !== undefined && !opts.instantiate && !opts.materializeOnly) {
+        console.error("--operation-id requires --instantiate or --materialize-only.");
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.operationId !== undefined && !await requireOperationCapability(client,
+        opts.materializeOnly ? "rig.materialize" : "rig.import")) return;
 
       if (opts.workspaceOnly) {
         if (!opts.targetRig) {
@@ -126,22 +135,26 @@ export function importCommand(depsOverride?: ImportDeps): Command {
         const headers = {
           ...extraHeaders,
           ...(opts.targetRig ? { "X-Target-Rig-Id": opts.targetRig } : {}),
+          ...(opts.operationId !== undefined ? { "X-OpenRig-Operation-Id": opts.operationId } : {}),
         };
         const res = await client.postText<{ rigId: string; specName: string; specVersion: string; nodes: Array<{ logicalId: string; status: string }> } | { ok: false; code: string; errors?: string[]; message?: string; error?: string }>("/api/rigs/import/materialize", yaml, "text/yaml", headers);
-        if (res.status === 409 || res.status === 400 || res.status === 404) {
+        const result = operationResult(res.data, res.status, opts.operationId);
+        if (result === undefined) return;
+        res.data = result.value;
+        if (result.status === 409 || result.status === 400 || result.status === 404 || "code" in res.data) {
           const data = res.data as { ok?: false; code?: string; errors?: string[]; message?: string; error?: string };
           if (data.code === "rig_name_running") {
             console.error(data.error ?? data.message ?? "A rig with this name is already running.");
             process.exitCode = 1;
             return;
           }
-          const detail = data.errors?.join("\n  ") ?? data.message ?? data.error ?? `status ${res.status}`;
+          const detail = data.errors?.join("\n  ") ?? data.message ?? data.error ?? data.code ?? `status ${result.status}`;
           console.error(`Materialize failed:\n  ${detail}\nFix: update your spec or target rig and retry.`);
           process.exitCode = 1;
           return;
         }
-        if (res.status >= 400) {
-          console.error(`Materialize failed (HTTP ${res.status}). Check spec and daemon logs.`);
+        if (result.status >= 400) {
+          console.error(`Materialize failed (HTTP ${result.status}). Check spec and daemon logs.`);
           process.exitCode = 1;
           return;
         }
@@ -158,21 +171,24 @@ export function importCommand(depsOverride?: ImportDeps): Command {
           "/api/rigs/import",
           yaml,
           "text/yaml",
-          extraHeaders,
+          { ...extraHeaders, ...(opts.operationId !== undefined ? { "X-OpenRig-Operation-Id": opts.operationId } : {}) },
           { timeoutMs: LONG_RUNNING_IMPORT_TIMEOUT_MS },
         );
-        if (res.status === 409 || res.status === 400) {
+        const result = operationResult(res.data, res.status, opts.operationId);
+        if (result === undefined) return;
+        res.data = result.value;
+        if (result.status === 409 || result.status === 400 || "code" in res.data) {
           const data = res.data as { ok: false; code: string; errors?: string[]; message?: string; error?: string };
           if (data.code === "rig_name_running") {
             console.error(data.error ?? data.message ?? "A rig with this name is already running.");
             process.exitCode = 1;
             return;
           }
-          const detail = data.errors?.join("\n  ") ?? data.message ?? `status ${res.status}`;
+          const detail = data.errors?.join("\n  ") ?? data.message ?? data.code ?? `status ${result.status}`;
           console.error(`Import failed:\n  ${detail}\nFix: check your rig spec and retry. Validate first with: rig spec validate <path>`);
           process.exitCode = 1;
-        } else if (res.status >= 400) {
-          console.error(`Import failed (HTTP ${res.status}). Check spec and daemon logs.`);
+        } else if (result.status >= 400) {
+          console.error(`Import failed (HTTP ${result.status}). Check spec and daemon logs.`);
           process.exitCode = 1;
         } else {
           const data = res.data as { rigId: string; specName: string; specVersion: string; nodes: Array<{ logicalId: string; status: string }>; attachCommand?: string; warnings?: string[] };

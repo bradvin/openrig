@@ -14,6 +14,10 @@ import { RigNotFoundError } from "../domain/errors.js";
 import { runtimeVersionProbeCwd } from "../adapters/preflight-exec.js";
 import { execRuntimeProbe } from "../adapters/runtime-probe-exec.js";
 import { RigSpecParseError, validateRigSpecImport } from "../domain/spec-validation-service.js";
+import { normalizedOperationRoot, parseOperationYaml } from "../domain/operation-service.js";
+import { operationValidationFields } from "../domain/operation-public-result.js";
+import { completeOperationHttp, operationFailureHttp, operationHttp, operationId, operationService, reservationHttp } from "./operations.js";
+import { runOperationMutation } from "../domain/operation-mutation-lane.js";
 
 export const rigspecImportRoutes = new Hono();
 
@@ -90,13 +94,49 @@ rigspecImportRoutes.post("/", async (c) => {
   }
 
   const isPodAware = raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).pods);
+  const requestedId = operationId(c);
 
   if (isPodAware) {
     const rigRoot = c.req.header("X-Rig-Root");
     if (!rigRoot) return c.json({ error: "X-Rig-Root header required for pod-aware specs", code: "missing_rig_root" }, 400);
     const cwdOverride = c.req.header("X-Cwd-Override") ?? undefined;
 
-    const outcome = await podInstantiator.instantiate(body, rigRoot, { cwdOverride });
+    const operations = requestedId === undefined ? undefined : operationService(c);
+    if (operations && requestedId !== undefined) {
+      let reservation;
+      try {
+        reservation = operations.reserve({ operationId: requestedId, kind: "rig.import",
+          targetIds: {}, payload: parseOperationYaml(body),
+          options: { rigRoot: normalizedOperationRoot(rigRoot),
+            ...(cwdOverride === undefined ? {} : { cwdOverride: normalizedOperationRoot(cwdOverride) }) }, expectsExternal: true });
+      } catch { return c.json({ error: "invalid_operation_request" }, 400); }
+      const prior = reservationHttp(reservation);
+      if (prior) return prior;
+    }
+
+    const importWork = () => podInstantiator.instantiate(body, rigRoot, { cwdOverride,
+      ...(operations && requestedId !== undefined ? { operation: { service: operations, operationId: requestedId } } : {}) });
+    let outcome;
+    try { outcome = operations && requestedId !== undefined
+      ? await runOperationMutation(operations.repository.db,
+        `name:${typeof (raw as Record<string, unknown>).name === "string" ? (raw as Record<string, unknown>).name : requestedId}`,
+        importWork) : await importWork(); }
+    catch (error) {
+      if (operations && requestedId !== undefined) return operationFailureHttp(operations, requestedId);
+      throw error;
+    }
+    if (operations && requestedId !== undefined) {
+      const status = outcome.ok ? 201 : outcome.code === "validation_failed" || outcome.code === "cycle_error" ? 400
+        : outcome.code === "preflight_failed" || outcome.code === "rig_name_running"
+          || outcome.code === "generation_unconfirmed" || outcome.code === "compose_project_conflict" ? 409 : 500;
+      const result = outcome.ok
+        ? { rigId: outcome.result.rigId, specName: outcome.result.specName,
+          specVersion: outcome.result.specVersion,
+          nodes: outcome.result.nodes.map((node) => ({ logicalId: node.logicalId, status: node.status })) }
+        : { code: outcome.code, ...((outcome.code === "validation_failed" || outcome.code === "preflight_failed") && "errors" in outcome
+          ? { errors: operationValidationFields(outcome.errors) } : {}) };
+      return completeOperationHttp(operations, requestedId, status, result);
+    }
     if (!outcome.ok) {
       const status = outcome.code === "validation_failed" ? 400
         : outcome.code === "preflight_failed" ? 409
@@ -118,15 +158,54 @@ rigspecImportRoutes.post("/", async (c) => {
   }
 
   // Legacy path
+  const operations = requestedId === undefined ? undefined : operationService(c);
+  if (operations && requestedId !== undefined) {
+    let reservation;
+    try {
+      reservation = operations.reserve({ operationId: requestedId, kind: "rig.import",
+        targetIds: {}, payload: parseOperationYaml(body), options: {}, expectsExternal: true });
+    } catch { return c.json({ error: "invalid_operation_request" }, 400); }
+    const prior = reservationHttp(reservation);
+    if (prior) return prior;
+  }
   let spec;
   try {
     spec = LegacyRigSpecSchema.normalize(raw);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (operations && requestedId !== undefined) {
+      const receipt = operations.repository.db.transaction(() => {
+        operations.completeWithinTransaction({ operationId: requestedId, phase: "completed",
+          target: { nodeIds: [] }, effect: "none", external: "not_started",
+          httpStatus: 400, result: { code: "validation_failed", errors: operationValidationFields([message]) } });
+        return operations.read(requestedId)!;
+      }).immediate();
+      return operationHttp(receipt, 400);
+    }
     return c.json({ error: message, errors: [message] }, 400);
   }
 
-  const outcome = await instantiator.instantiate(spec);
+  const legacyWork = () => instantiator.instantiate(spec,
+    operations && requestedId !== undefined ? { operation: { service: operations, operationId: requestedId } } : undefined);
+  let outcome;
+  try { outcome = operations && requestedId !== undefined
+    ? await runOperationMutation(operations.repository.db, `name:${spec.name}`, legacyWork)
+    : await legacyWork(); }
+  catch (error) {
+    if (operations && requestedId !== undefined) return operationFailureHttp(operations, requestedId);
+    throw error;
+  }
+  if (operations && requestedId !== undefined) {
+    const status = outcome.ok ? 201 : outcome.code === "validation_failed" ? 400
+      : outcome.code === "preflight_failed" || outcome.code === "rig_name_running" ? 409 : 500;
+    const result = outcome.ok
+      ? { rigId: outcome.result.rigId, specName: outcome.result.specName,
+        specVersion: outcome.result.specVersion,
+        nodes: outcome.result.nodes.map((node) => ({ logicalId: node.logicalId, status: node.status })) }
+      : { code: outcome.code, ...((outcome.code === "validation_failed" || outcome.code === "preflight_failed") && "errors" in outcome
+        ? { errors: operationValidationFields(outcome.errors) } : {}) };
+    return completeOperationHttp(operations, requestedId, status, result);
+  }
   if (!outcome.ok) {
     const status = outcome.code === "validation_failed" ? 400
       : outcome.code === "preflight_failed" ? 409
@@ -204,14 +283,45 @@ rigspecImportRoutes.post("/materialize", async (c) => {
 
   const targetRigId = c.req.header("X-Target-Rig-Id") ?? undefined;
   const cwdOverride = c.req.header("X-Cwd-Override") ?? undefined;
-  const outcome = await podInstantiator.materialize(body, rigRoot, { targetRigId, cwdOverride });
+  const requestedId = operationId(c);
+  const operations = requestedId === undefined ? undefined : operationService(c);
+  if (operations && requestedId !== undefined) {
+    let reservation;
+    try {
+      reservation = operations.reserve({ operationId: requestedId, kind: "rig.materialize",
+        targetIds: targetRigId === undefined ? {} : { rigId: targetRigId },
+        payload: parseOperationYaml(body), options: { rigRoot: normalizedOperationRoot(rigRoot),
+          ...(cwdOverride === undefined ? {} : { cwdOverride: normalizedOperationRoot(cwdOverride) }),
+          ...(targetRigId === undefined ? {} : { targetRigId }) }, expectsExternal: true });
+    } catch { return c.json({ error: "invalid_operation_request" }, 400); }
+    const prior = reservationHttp(reservation);
+    if (prior) return prior;
+  }
+  const materializeWork = () => podInstantiator.materialize(body, rigRoot, { targetRigId, cwdOverride,
+    ...(operations && requestedId !== undefined ? { operation: { service: operations, operationId: requestedId } } : {}) });
+  let outcome;
+  try { outcome = operations && requestedId !== undefined
+    ? await runOperationMutation(operations.repository.db,
+      targetRigId ? `rig:${targetRigId}` : `name:${typeof (raw as Record<string, unknown>).name === "string" ? (raw as Record<string, unknown>).name : requestedId}`,
+      materializeWork) : await materializeWork(); }
+  catch (error) {
+    if (operations && requestedId !== undefined) return operationFailureHttp(operations, requestedId);
+    throw error;
+  }
+  const status = outcome.ok ? 201 : outcome.code === "validation_failed" ? 400
+    : outcome.code === "preflight_failed" ? 409
+    : outcome.code === "target_rig_not_found" ? 404
+    : outcome.code === "materialize_conflict" || outcome.code === "rig_name_running" ? 409 : 500;
+  if (operations && requestedId !== undefined) {
+    const result = outcome.ok
+      ? { rigId: outcome.result.rigId, specName: outcome.result.specName,
+        specVersion: outcome.result.specVersion,
+        nodes: outcome.result.nodes.map((node) => ({ logicalId: node.logicalId, status: "materialized" })) }
+      : { code: outcome.code, ...((outcome.code === "validation_failed" || outcome.code === "preflight_failed") && "errors" in outcome
+        ? { errors: operationValidationFields(outcome.errors) } : {}) };
+    return completeOperationHttp(operations, requestedId, status, result);
+  }
   if (!outcome.ok) {
-    const status = outcome.code === "validation_failed" ? 400
-      : outcome.code === "preflight_failed" ? 409
-      : outcome.code === "target_rig_not_found" ? 404
-      : outcome.code === "materialize_conflict" ? 409
-      : outcome.code === "rig_name_running" ? 409
-      : 500;
     const body = outcome.code === "rig_name_running"
       ? { ...outcome, error: outcome.message }
       : outcome;

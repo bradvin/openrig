@@ -37,20 +37,60 @@ function node(value: unknown, kind: OperationKind): Record<string, string> {
     ...(row.nodeId === undefined ? {} : { nodeId: string(row.nodeId) }), status };
 }
 
-function failure(value: Record<string, unknown>): Record<string, string> {
-  const row = object(value, ["code"]);
+const VALIDATION_FIELDS = new Set([
+  "request", "spec", "schema_version", "name", "version", "nodes", "edges", "pods",
+  "id", "label", "members", "member", "runtime", "agent_ref", "profile", "cwd",
+  "from", "to", "kind", "workspace", "workspace_root", "repos", "path",
+  "default_repo", "knowledge_root", "culture_file", "docs", "startup", "services",
+  "env", "managed_blocks", "permission_policy", "restore_policy", "model", "effort",
+  "role", "session_source", "non_interruptive", "continuity_policy",
+]);
+
+/** Keep structural field guidance, never variable values from a spec, path, env, or preflight error. */
+export function operationValidationFields(value: unknown): string[] {
+  if (!Array.isArray(value)) return ["request: invalid"];
+  const fields: string[] = [];
+  for (const raw of value.slice(0, 64)) {
+    if (typeof raw !== "string") continue;
+    const prefix = raw.match(/^([a-z][a-z0-9_]*(?:\[\d+\]|\.[a-z][a-z0-9_]*|\.\[\d+\])*)(?::|\s)/)?.[1];
+    const segments = prefix?.replace(/\[\d+\]/g, "").split(".") ?? [];
+    const field = prefix && Buffer.byteLength(prefix, "utf8") <= 96
+      && segments.every((segment) => VALIDATION_FIELDS.has(segment)) ? prefix : "request";
+    const item = `${field}: invalid`;
+    if (!fields.includes(item)) fields.push(item);
+  }
+  return fields.length > 0 ? fields : ["request: invalid"];
+}
+
+function failure(value: Record<string, unknown>, kind: OperationKind): Record<string, unknown> {
+  const row = object(value, kind === "member.add" ? ["ok", "code", "errors"] : ["code", "errors"]);
   const code = string(row.code, 64);
   if (!/^[a-z][a-z0-9_]*$/.test(code)) throw new Error("operation_result_invalid_code");
-  return { code };
+  if (row.errors !== undefined && code !== "validation_failed" && code !== "preflight_failed") {
+    throw new Error("operation_result_invalid_shape");
+  }
+  const errors = row.errors === undefined ? undefined : array(row.errors, 64).map((item) => {
+    const field = string(item, 112);
+    if (!field.endsWith(": invalid")) throw new Error("operation_result_invalid_validation_field");
+    const path = field.slice(0, -9);
+    const segments = path.replace(/\[\d+\]/g, "").split(".");
+    if (!segments.every((segment) => VALIDATION_FIELDS.has(segment))) throw new Error("operation_result_invalid_validation_field");
+    return field;
+  });
+  if (kind === "member.add") {
+    if (row.ok !== undefined && row.ok !== false) throw new Error("operation_result_invalid_shape");
+    return { ok: false, code, ...(errors === undefined ? {} : { errors }) };
+  }
+  return { code, ...(errors === undefined ? {} : { errors }) };
 }
 
 export function validateOperationPublicResult(kind: OperationKind, value: unknown): unknown {
   const row = object(value, kind === "rig.create"
-    ? ["id", "name", "createdAt", "updatedAt", "code"]
+    ? ["id", "name", "createdAt", "updatedAt", "code", "errors"]
     : kind === "member.add"
-      ? ["podId", "podNamespace", "node", "edges", "code"]
-      : ["rigId", "specName", "specVersion", "nodes", "code"]);
-  if (row.code !== undefined) return failure(row);
+      ? ["ok", "result", "code", "errors"]
+      : ["rigId", "specName", "specVersion", "nodes", "code", "errors"]);
+  if (row.code !== undefined) return failure(row, kind);
 
   if (kind === "rig.create") {
     if (row.id === undefined || row.name === undefined) throw new Error("operation_result_invalid_shape");
@@ -66,15 +106,18 @@ export function validateOperationPublicResult(kind: OperationKind, value: unknow
       ...(row.nodes === undefined ? {} : { nodes: array(row.nodes, 256).map((item) => node(item, kind)) }) };
   }
 
-  if (row.podId === undefined || row.podNamespace === undefined || row.node === undefined) {
+  if (row.ok !== true || row.result === undefined) throw new Error("operation_result_invalid_shape");
+  const memberResult = object(row.result, ["podId", "podNamespace", "node", "edges"]);
+  if (memberResult.podId === undefined || memberResult.podNamespace === undefined || memberResult.node === undefined) {
     throw new Error("operation_result_invalid_shape");
   }
-  const member = node(row.node, kind);
+  const member = node(memberResult.node, kind);
   if (!member.nodeId) throw new Error("operation_result_invalid_shape");
-  const edges = row.edges === undefined ? undefined : array(row.edges, 512).map((item) => {
+  const edges = memberResult.edges === undefined ? undefined : array(memberResult.edges, 512).map((item) => {
     const edge = object(item, ["from", "to", "kind"]);
     return { from: string(edge.from), to: string(edge.to), kind: string(edge.kind) };
   });
-  return { podId: string(row.podId), podNamespace: string(row.podNamespace), node: member,
-    ...(edges === undefined ? {} : { edges }) };
+  return { ok: true, result: { podId: string(memberResult.podId),
+    podNamespace: string(memberResult.podNamespace), node: member,
+    ...(edges === undefined ? {} : { edges }) } };
 }

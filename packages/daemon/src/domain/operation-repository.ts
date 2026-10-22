@@ -92,7 +92,9 @@ export class OperationRepository {
       ...(row.result_http_status === null ? {} : { originalHttpStatus: row.result_http_status }),
       ...(row.result_json === null ? {} : { result: JSON.parse(row.result_json) as unknown }),
       effects: effects.map((effect) => ({ step: effect.step, kind: effect.kind,
-        ...(effect.target_id === null ? {} : { targetId: effect.target_id }), state: effect.state })),
+        ...(effect.target_id === null ? {} : { targetId: effect.target_id }), state: effect.state,
+        ...(effect.external_outcome === null ? {} : { externalOutcome: effect.external_outcome }),
+        evidence: JSON.parse(effect.evidence_json) as OperationEvidence })),
       ...(row.recovery_json === null ? {} : { recovery: JSON.parse(row.recovery_json) as { code: string; message: string } }),
       createdAt: row.created_at, updatedAt: row.updated_at,
     };

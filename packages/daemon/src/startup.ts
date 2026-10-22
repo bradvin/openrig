@@ -22,6 +22,8 @@ import { migrate } from "./db/migrate.js";
 // never an inline copy that can drift out of sync with the daemon's schema.
 import { ALL_MIGRATIONS } from "./db/all-migrations.js";
 import { RigRepository } from "./domain/rig-repository.js";
+import { OperationRepository } from "./domain/operation-repository.js";
+import { OperationService } from "./domain/operation-service.js";
 import { SessionRegistry } from "./domain/session-registry.js";
 import { NativePermissionStore } from "./domain/native-permission-store.js";
 import { deriveCanonicalSessionName, isHumanSeatSessionRef, parseSessionName } from "./domain/session-name.js";
@@ -323,6 +325,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   for (const warning of databaseWarnings) console.warn(`Warning: ${warning}`);
   const db = createDb(dbPath);
   migrate(db, ALL_MIGRATIONS);
+  const operationService = new OperationService(new OperationRepository(db));
+  operationService.recoverInterrupted();
 
   // 51-09 increment 1 — establish the daemon's durable self-host identity at
   // boot (mint on first boot, reconcile thereafter). host.name is a display-only
@@ -1308,6 +1312,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
 
   const deps: AppDeps = {
+    operationService,
     databaseWarnings,
     rigRepo,
     sessionRegistry,

@@ -310,6 +310,7 @@ import { rigPreflight, preflightValidatedSpec } from "./rigspec-preflight.js";
 import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
 import { resolveAdvisorModel, resolveNodeConfig, selectedPluginPaths } from "./profile-resolver.js";
 import { resolveStartup } from "./startup-resolver.js";
+import { isCommunityHarnessRuntime } from "./built-in-runtimes.js";
 import { planProjection, claudeConflictTargetPath, projectionConflictWarnings, filterProtectedProjections, type ProjectionPlan } from "./projection-planner.js";
 import { ProjectionManifestStore } from "./projection-manifest-store.js";
 import { StartupOrchestrator } from "./startup-orchestrator.js";
@@ -627,6 +628,14 @@ export class PodRigInstantiator {
     });
     if (!preflight.ready) {
       return { ok: false, code: "preflight_failed", errors: preflight.errors, warnings: preflight.warnings };
+    }
+    // A pod added to a running rig inherits the rig's layers; stop before it exists if a required one is gone,
+    // when at least one added member reads startup files.
+    if (opts?.targetRigId && targetRig && rigSpec.pods.some((pod) => pod.members.some((m) => this.runtimeTakesStartupFiles(m.runtime)))) {
+      const missingInherited = this.inheritedStartupFileErrors(opts.targetRigId, targetRig.rig.name);
+      if (missingInherited.length > 0) {
+        return { ok: false, code: "preflight_failed", errors: missingInherited, warnings: preflight.warnings };
+      }
     }
 
     return this.materializeValidatedSpec(rigSpec, rigRoot, preflight.warnings, opts);
@@ -1075,6 +1084,14 @@ export class PodRigInstantiator {
     });
     if (!preflight.ready) {
       return { ok: false, code: "preflight_failed", errors: preflight.errors, warnings: preflight.warnings };
+    }
+
+    // 6b. Stop before a seat exists if a required file the rig or this pod declared is gone, for a runtime that reads startup files.
+    const missingInherited = this.runtimeTakesStartupFiles(member.runtime)
+      ? this.inheritedStartupFileErrors(rigId, rig.rig.name, podNamespace)
+      : [];
+    if (missingInherited.length > 0) {
+      return { ok: false, code: "preflight_failed", errors: missingInherited, warnings: preflight.warnings };
     }
 
     // 7. Validate + resolve any declared pod-local edges BEFORE creating the
@@ -2011,8 +2028,66 @@ export class PodRigInstantiator {
 
   /** Store the rig culture file and rig startup block the spec declares, with the absolute root they resolve against. */
   private persistRigStartupLayers(rigId: string, rigSpec: PodRigSpec, rigRoot: string): void {
-    if (!rigSpec.cultureFile && !rigSpec.startup) return;
-    this.deps.rigRepo.setRigStartupLayers(rigId, { root: nodePath.resolve(rigRoot), cultureFile: rigSpec.cultureFile, startup: rigSpec.startup });
+    const podStartupFiles: Record<string, StartupFile[]> = {};
+    for (const pod of rigSpec.pods) {
+      if (pod.startup?.files.length) podStartupFiles[pod.id] = pod.startup.files;
+    }
+    const hasPodFiles = Object.keys(podStartupFiles).length > 0;
+    if (!rigSpec.cultureFile && !rigSpec.startup && !hasPodFiles) return;
+    this.deps.rigRepo.setRigStartupLayers(rigId, {
+      root: nodePath.resolve(rigRoot),
+      cultureFile: rigSpec.cultureFile,
+      startup: rigSpec.startup,
+      ...(hasPodFiles ? { podStartupFiles } : {}),
+    });
+  }
+
+  /** Whether a runtime reads startup files at all. A terminal seat's adapter delivers nothing, and a community harness
+   *  takes none (it only warns), so a missing file can't fail either; main adds them today and keeps doing so. */
+  private runtimeTakesStartupFiles(runtime: string): boolean {
+    return runtime !== "terminal" && !isCommunityHarnessRuntime(runtime);
+  }
+
+  /** Why an add must stop: a startup file the rig or the pod declared as required, or the rig's declared `culture_file`,
+   *  that the add would inherit but cannot read. Empty when nothing is recorded (a rig created before the record, or
+   *  one that declared nothing) or every such file reads. Optional files and files that apply only on restore are not checked. */
+  private inheritedStartupFileErrors(rigId: string, rigName: string, podId?: string): string[] {
+    const layers = this.deps.rigRepo.getRigStartupLayers(rigId);
+    if (!layers) return [];
+    const readable = (absolutePath: string): boolean => {
+      try {
+        this.deps.fsOps.readFile(absolutePath);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const errors: string[] = [];
+    const check = (path: string, owner: string, what: string): void => {
+      const absolutePath = nodePath.resolve(layers.root, path);
+      if (!readable(absolutePath)) {
+        errors.push(`${what} "${path}" (${absolutePath}), declared by ${owner}, is missing or unreadable.`);
+      }
+    };
+    const rigOwner = `rig "${rigName}"`;
+    if (layers.cultureFile) check(layers.cultureFile, rigOwner, "The rig's culture_file");
+    for (const f of layers.startup?.files ?? []) {
+      if (f.required && f.appliesOn.includes("fresh_start")) check(f.path, rigOwner, "Required startup file");
+    }
+    for (const f of (podId ? layers.podStartupFiles?.[podId] : undefined) ?? []) {
+      if (f.required && f.appliesOn.includes("fresh_start")) check(f.path, `pod "${podId}" of ${rigOwner}`, "Required startup file");
+    }
+    if (errors.length > 0) errors.push("No seat was added. Restore the file, then run the command again.");
+    return errors;
+  }
+
+  /** The files a seat's pod contributes: the pod's own startup when the launching spec declares it (a declared seat),
+   *  else the pod files recorded when the rig was created (a seat added to that pod), resolved against the rig's stored root. */
+  private podStartupResolvedFiles(pod: RigSpecPod, rigLayers: RigStartupLayers, rigRoot: string): ResolvedStartupFile[] {
+    if (pod.startup) {
+      return pod.startup.files.map((f) => ({ ...f, absolutePath: nodePath.resolve(rigRoot, f.path), ownerRoot: rigRoot }));
+    }
+    return (rigLayers.podStartupFiles?.[pod.id] ?? []).map((f) => ({ ...f, absolutePath: nodePath.resolve(rigLayers.root, f.path), ownerRoot: rigLayers.root }));
   }
 
   /** The rig culture file and rig startup block a seat launches with, and the root they resolve against: the spec's
@@ -2698,11 +2773,7 @@ export class PodRigInstantiator {
       }
     }
     // Layer 5: Pod startup
-    if (pod.startup) {
-      for (const f of pod.startup.files) {
-        files.push({ ...f, absolutePath: nodePath.resolve(rigRoot, f.path), ownerRoot: rigRoot });
-      }
-    }
+    files.push(...this.podStartupResolvedFiles(pod, rigLayers, rigRoot));
     // Layer 6: Member startup
     if (member.startup) {
       for (const f of member.startup.files) {
@@ -2754,11 +2825,7 @@ export class PodRigInstantiator {
       }
     }
     // 5. Pod startup
-    if (pod.startup) {
-      for (const f of pod.startup.files) {
-        files.push({ ...f, absolutePath: nodePath.resolve(rigRoot, f.path), ownerRoot: rigRoot });
-      }
-    }
+    files.push(...this.podStartupResolvedFiles(pod, rigLayers, rigRoot));
     // 6. Member startup
     if (member.startup) {
       for (const f of member.startup.files) {

@@ -15,7 +15,7 @@ import { createDaemon } from "../src/startup.js";
 import { RigSpecExporter as RigSpecExporterClass } from "../src/domain/rigspec-exporter.js";
 import { RigInstantiator } from "../src/domain/rigspec-instantiator.js";
 import { OperationRepository } from "../src/domain/operation-repository.js";
-import { OperationService } from "../src/domain/operation-service.js";
+import { OperationService, parseOperationYaml } from "../src/domain/operation-service.js";
 import { RigSpecPreflight } from "../src/domain/rigspec-preflight.js";
 import { RigRepository as RigRepoClass } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
@@ -762,6 +762,69 @@ describe("Rigspec import routes (pod-aware dual-stack)", () => {
     expect(afterDeletion.status).toBe(200);
     expect(await afterDeletion.json()).toMatchObject({ replayed: true, result: { rigId: created.result.rigId } });
     expect(db.prepare("SELECT COUNT(*) AS n FROM rigs WHERE name = 'live-topology'").get()).toEqual({ n: 0 });
+  });
+
+  it("createApp recovers a prior-boot receipt even with an injected operation service", async () => {
+    const isolatedDb = createFullTestDb();
+    try {
+      const id = randomUUID();
+      const prior = new OperationService(new OperationRepository(isolatedDb));
+      const request = { operationId: id, kind: "rig.import" as const, targetIds: {},
+        payload: parseOperationYaml(MATERIALIZE_POD_YAML), options: { rigRoot: "/tmp" }, expectsExternal: true };
+      expect(prior.reserve(request).kind).toBe("reserved");
+
+      const injected = new OperationService(new OperationRepository(isolatedDb));
+      const setup = createTestApp(isolatedDb, { appDeps: { operationService: injected } });
+      const instantiate = vi.spyOn(setup.podInstantiator, "instantiate");
+      const lookup = await setup.app.request(`/api/operations/${id}`);
+      expect(lookup.status).toBe(200);
+      expect(await lookup.json()).toMatchObject({ operation: { operationId: id, state: "interrupted",
+        recovery: { code: "new_operation_required" } } });
+
+      const retry = await setup.app.request("/api/rigs/import", { method: "POST",
+        headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
+        body: MATERIALIZE_POD_YAML });
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toMatchObject({ replayed: true,
+        operation: { operationId: id, state: "interrupted" } });
+      expect(instantiate).not.toHaveBeenCalled();
+      expect(isolatedDb.prepare("SELECT COUNT(*) AS n FROM rigs").get()).toEqual({ n: 0 });
+    } finally { isolatedDb.close(); }
+  });
+
+  it("createApp leaves this boot's injected in-flight receipt running", async () => {
+    const isolatedDb = createFullTestDb();
+    try {
+      const id = randomUUID();
+      const injected = new OperationService(new OperationRepository(isolatedDb));
+      const request = { operationId: id, kind: "rig.import" as const, targetIds: {},
+        payload: parseOperationYaml(MATERIALIZE_POD_YAML), options: { rigRoot: "/tmp" }, expectsExternal: true };
+      expect(injected.reserve(request).kind).toBe("reserved");
+
+      const setup = createTestApp(isolatedDb, { appDeps: { operationService: injected } });
+      const instantiate = vi.spyOn(setup.podInstantiator, "instantiate");
+      const lookup = await setup.app.request(`/api/operations/${id}`);
+      expect(await lookup.json()).toMatchObject({ operation: { operationId: id, state: "running" } });
+      const retry = await setup.app.request("/api/rigs/import", { method: "POST",
+        headers: { "Content-Type": "text/yaml", "X-Rig-Root": "/tmp", "X-OpenRig-Operation-Id": id },
+        body: MATERIALIZE_POD_YAML });
+      expect(retry.status).toBe(202);
+      expect(await retry.json()).toMatchObject({ operation: { operationId: id, state: "running" } });
+      expect(instantiate).not.toHaveBeenCalled();
+      expect(isolatedDb.prepare("SELECT COUNT(*) AS n FROM rigs").get()).toEqual({ n: 0 });
+    } finally { isolatedDb.close(); }
+  });
+
+  it("createApp rejects an injected service on another DB before recovery", () => {
+    const db1 = createFullTestDb();
+    const db2 = createFullTestDb();
+    try {
+      const wrongService = new OperationService(new OperationRepository(db2));
+      const recover = vi.spyOn(wrongService, "recoverInterrupted");
+      expect(() => createTestApp(db1, { appDeps: { operationService: wrongService } }))
+        .toThrow(/operationService.*same db handle/);
+      expect(recover).not.toHaveBeenCalled();
+    } finally { db1.close(); db2.close(); }
   });
 
   it("terminalizes a materialize result-write fault after committed topology", async () => {

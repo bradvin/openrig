@@ -447,7 +447,7 @@ function isUiAssetRequestPath(requestPath: string): boolean {
     || relativePath === "manifest.webmanifest";
 }
 
-/** Build routes around one database, recovering prior-boot receipts when creating their shared service. */
+/** Build routes around one database and recover prior-boot receipts before accepting requests. */
 export function createApp(deps: AppDeps): Hono {
   // Hard runtime invariant: all domain services must share the same db handle.
   if (deps.rigRepo.db !== deps.eventBus.db) {
@@ -506,7 +506,7 @@ export function createApp(deps: AppDeps): Hono {
   // route can accept a mutation, including in direct createApp test harnesses.
   const operationService = deps.operationService ?? new OperationService(new OperationRepository(deps.rigRepo.db));
   if (operationService.repository.db !== deps.rigRepo.db) throw new Error("createApp: operationService must share the same db handle");
-  if (!deps.operationService) operationService.recoverInterrupted();
+  operationService.recoverInterrupted();
 
   const app = new Hono();
   if (deps.requestPhaseObserver) app.use("*", deps.requestPhaseObserver.middleware());

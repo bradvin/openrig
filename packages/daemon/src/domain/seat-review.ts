@@ -24,7 +24,9 @@ export interface SeatReviewDescriptor {
   liveState: { sessionStatus: string | null; observation: "persisted_only" | "present" | "absent" | "transport_unavailable" | "unverified"; detail?: string };
 }
 
+/** Hash revision inputs and native tokens without returning their original values. */
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
+/** Represent a nonempty native token by its hash; absent tokens have no history identity. */
 const tokenHash = (value: unknown): string | null => typeof value === "string" && value.trim() ? sha256(value) : null;
 
 /** Sort object keys recursively so equivalent JSON objects produce the same revision input. */

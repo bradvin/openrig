@@ -181,6 +181,7 @@ async function applyToSeat(
   if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
 }
 
+/** Register native policy commands and the seat-only review-file option on either CLI path. */
 function registerPermissionCommands(cmd: Command, getDeps: () => StatusDeps): void {
 
   cmd

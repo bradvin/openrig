@@ -275,6 +275,7 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
   });
 }
 
+/** Map checked-change refusals and uncertain stop outcomes to their public HTTP status. */
 function seatLifecycleStatus(code: string): 400 | 404 | 409 | 500 | 502 {
   if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "fresh_required"
     || code === "missing_effort" || code === "invalid_effort" || code === "invalid_policy"

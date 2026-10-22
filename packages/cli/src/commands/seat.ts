@@ -296,6 +296,7 @@ function printSeatError(error: SeatStatusError, fallback: string): void {
   }
 }
 
+/** Build seat commands, including review retrieval and checked stop and permission changes. */
 export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promise<string> }): Command {
   const cmd = new Command("seat")
     .description("Inspect OpenRig seat observability state");

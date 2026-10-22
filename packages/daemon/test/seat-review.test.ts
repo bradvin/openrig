@@ -53,6 +53,7 @@ describe("checked seat selection", () => {
   });
   afterEach(() => { db.close(); custody = false; lifecycle = false; onProbe = undefined; beforeKill = undefined; });
 
+  /** Create a persisted seat with a native history token and its initial review. */
   function seat(name = "review") {
     const rig = repo.createRig(name);
     const node = repo.addNode(rig.id, "dev", { runtime: "codex", cwd: "/tmp", model: "m" });
@@ -107,6 +108,7 @@ describe("checked seat selection", () => {
     expect(readSeatReview(db, s.node.id)!.review.revision).not.toBe(malformed.revision);
   });
 
+  /** Exercise checked stops through the real custody guard and an observable tmux stub. */
   function guardedTmux(onCommand?: (argv: string[]) => void) {
     db.close();
     db = new Database(":memory:");

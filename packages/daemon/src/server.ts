@@ -447,6 +447,7 @@ function isUiAssetRequestPath(requestPath: string): boolean {
     || relativePath === "manifest.webmanifest";
 }
 
+/** Build routes around one database, recovering prior-boot receipts when creating their shared service. */
 export function createApp(deps: AppDeps): Hono {
   // Hard runtime invariant: all domain services must share the same db handle.
   if (deps.rigRepo.db !== deps.eventBus.db) {

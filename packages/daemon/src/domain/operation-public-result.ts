@@ -14,21 +14,25 @@ function object(value: unknown, keys: readonly string[]): Record<string, unknown
   return record;
 }
 
+/** Accept nonempty text within its UTF-8 byte limit, excluding CR, LF, and NUL. */
 function string(value: unknown, max = 256): string {
   if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > max
     || /[\r\n\0]/.test(value)) throw new Error("operation_result_invalid_string");
   return value;
 }
 
+/** Preserve an omitted field; validate every supplied value as bounded text. */
 function optionalString(value: unknown, max = 256): string | undefined {
   return value === undefined ? undefined : string(value, max);
 }
 
+/** Bound a result collection before its elements are projected by the caller. */
 function array(value: unknown, max: number): unknown[] {
   if (!Array.isArray(value) || value.length > max) throw new Error("operation_result_invalid_array");
   return value;
 }
 
+/** Project node identity and enforce the statuses allowed for this operation kind. */
 function node(value: unknown, kind: OperationKind): Record<string, string> {
   const row = object(value, ["logicalId", "nodeId", "status"]);
   const status = string(row.status, 32);
@@ -63,6 +67,7 @@ export function operationValidationFields(value: unknown): string[] {
   return fields.length > 0 ? fields : ["request: invalid"];
 }
 
+/** Retain structured failure codes and allowlisted field paths, with explicit member-add failure state. */
 function failure(value: Record<string, unknown>, kind: OperationKind): Record<string, unknown> {
   const row = object(value, kind === "member.add" ? ["ok", "code", "errors"] : ["code", "errors"]);
   const code = string(row.code, 64);

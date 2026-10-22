@@ -170,6 +170,7 @@ export interface ProgramDeps {
   configPath?: string;
 }
 
+/** Build the full CLI command tree, including receipt reads, with injectable command dependencies. */
 export function createProgram(depsOverride?: ProgramDeps): Command {
   const program = configureRoot(new Command());
 

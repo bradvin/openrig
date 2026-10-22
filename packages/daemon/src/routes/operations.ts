@@ -5,10 +5,12 @@ import type { OperationService, Reservation } from "../domain/operation-service.
 
 export const operationRoutes = new Hono();
 
+/** Use the shared receipt service injected by createApp for this request. */
 export function operationService(c: Context): OperationService {
   return c.get("operationService" as never) as OperationService;
 }
 
+/** Read the opt-in header verbatim; validation occurs before reservation. */
 export function operationId(c: Context): string | undefined {
   const value = c.req.header("X-OpenRig-Operation-Id");
   return value === undefined ? undefined : value;

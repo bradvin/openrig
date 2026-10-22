@@ -68,10 +68,12 @@ export function operationRequestHash(request: Pick<OperationRequest, "kind" | "t
   return createHash("sha256").update(canonical).digest("hex");
 }
 
+/** Restrict persisted target and evidence IDs to bounded, stable tokens. */
 function safeId(value: string, label: string): void {
   if (!ID.test(value)) throw new Error(`invalid_${label}`);
 }
 
+/** Restrict journal step and phase keys to bounded path-like tokens. */
 function safeStep(value: string): void {
   if (!STEP.test(value)) throw new Error("invalid_operation_step");
 }

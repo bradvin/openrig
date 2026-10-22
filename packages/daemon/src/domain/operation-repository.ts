@@ -56,6 +56,7 @@ interface EffectRow {
   evidence_json: string;
 }
 
+/** Serialize a present receipt value as JSON for SQLite text columns. */
 function encode(value: unknown): string { return JSON.stringify(value); }
 
 export class OperationRepository {

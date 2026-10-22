@@ -235,6 +235,38 @@ describe("rig add", () => {
     expect(exitCode).toBeUndefined();
   });
 
+  it("rejects a malformed operation ID before capability and member requests", async () => {
+    const client = { get: vi.fn(), post: vi.fn() };
+    const command = makeCmd({ ...runningDeps(), clientFactory: () => client as unknown as DaemonClient });
+    const { logs, exitCode } = await captureLogs(() => command.parseAsync(["node", "rig", "add",
+      "rig-123", "infra", fragmentPath, "--operation-id", "bad-id", "--json"]));
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(logs.join("\n"))).toMatchObject({ ok: false, error: "invalid_operation_id" });
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("refuses malformed nested member results without throwing (json=%s)", async (json) => {
+    const id = "14e07638-8dc1-4827-a6a8-fb879899054b";
+    const client = {
+      get: vi.fn(async (path: string) => path === "/api/operations/capabilities"
+        ? { status: 200, data: { contract: "operations.v1", kinds: ["member.add"] } }
+        : { status: 200, data: [{ id: "rig-123", name: "test" }] }),
+      post: vi.fn(async () => ({ status: 201, data: {
+        operation: { operationId: id, state: "completed", effect: "committed" },
+        result: { ok: true, result: {} },
+      } })),
+    };
+    const command = makeCmd({ ...runningDeps(), clientFactory: () => client as unknown as DaemonClient });
+    const { logs, exitCode } = await captureLogs(() => command.parseAsync(["node", "rig", "add",
+      "rig-123", "infra", fragmentPath, "--operation-id", id, ...(json ? ["--json"] : [])]));
+    expect(exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("malformed result");
+    if (json) expect(JSON.parse(logs.join("\n"))).toMatchObject({ ok: false,
+      error: "invalid_operation_receipt" });
+    expect(client.post).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["failed", "running", "interrupted"])("--json reports a %s operation receipt with a nonzero exit", async (state) => {
     const id = "14e07638-8dc1-4827-a6a8-fb879899054b";
     const client = {

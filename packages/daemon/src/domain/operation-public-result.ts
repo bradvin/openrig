@@ -2,8 +2,9 @@ import type { OperationKind } from "../operation-surface.js";
 
 /**
  * Receipt results are explicit public projections. Callers must map legacy
- * responses into one of these shapes; this validator never stores an unknown
- * field or tries to recognize secrets in arbitrary prose.
+ * responses into one of these shapes. It bounds and whitelists fields while
+ * omitting arbitrary spec, environment, path, and preflight prose; allowed
+ * identifiers and names remain caller-supplied and are not scanned for secrets.
  */
 function object(value: unknown, keys: readonly string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)
@@ -84,6 +85,7 @@ function failure(value: Record<string, unknown>, kind: OperationKind): Record<st
   return { code, ...(errors === undefined ? {} : { errors }) };
 }
 
+/** Bound replayable result fields while leaving allowed names and IDs caller-supplied. */
 export function validateOperationPublicResult(kind: OperationKind, value: unknown): unknown {
   const row = object(value, kind === "rig.create"
     ? ["id", "name", "createdAt", "updatedAt", "code", "errors"]

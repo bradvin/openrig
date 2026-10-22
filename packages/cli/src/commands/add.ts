@@ -7,7 +7,7 @@ import { resolveRigHandle } from "../rig-handle.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
-import { operationResult, requireOperationCapability } from "./operation.js";
+import { malformedOperationResult, operationResult, requireOperationCapability, validOperationId } from "./operation.js";
 
 interface AddMemberResponse {
   ok: boolean;
@@ -24,11 +24,34 @@ interface AddMemberResponse {
   error?: string;
 }
 
+/** Check nested member fields before either output path reads a receipt result. */
+function usableAddReceiptResult(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const data = value as Record<string, unknown>;
+  if (typeof data.ok !== "boolean" || (data.errors !== undefined &&
+    (!Array.isArray(data.errors) || data.errors.some((error) => typeof error !== "string")))) return false;
+  if (data.result === undefined) return !data.ok;
+  if (!data.result || typeof data.result !== "object" || Array.isArray(data.result)) return false;
+  const result = data.result as Record<string, unknown>;
+  if (!result.node || typeof result.node !== "object" || Array.isArray(result.node)) return false;
+  const node = result.node as Record<string, unknown>;
+  if (typeof result.podNamespace !== "string" || typeof node.logicalId !== "string"
+    || typeof node.status !== "string") return false;
+  if (result.edges !== undefined && (!Array.isArray(result.edges) || result.edges.some((edge) => {
+    if (!edge || typeof edge !== "object" || Array.isArray(edge)) return true;
+    const row = edge as Record<string, unknown>;
+    return typeof row.from !== "string" || typeof row.kind !== "string" || typeof row.to !== "string";
+  }))) return false;
+  return result.warnings === undefined || (Array.isArray(result.warnings)
+    && result.warnings.every((warning) => typeof warning === "string"));
+}
+
 /** Quote a shell argument only when it needs it, so plain suggestions stay readable. */
 function shellArg(s: string): string {
   return /^[\w@%+=:,./-]+$/.test(s) ? s : shellQuote(s);
 }
 
+/** Resolve the target before adding a member; opted-in writes require a matching receipt. */
 export function addMemberCommand(depsOverride?: StatusDeps): Command {
   const cmd = new Command("add").description("Add a member to an existing pod in a running rig")
     .addHelpText("after", `
@@ -48,6 +71,7 @@ Examples:
     .option("--rig-root <path>", "Root directory for agent resolution")
     .option("--operation-id <uuid>", "Durable retry identity for this member addition")
     .action(async (rigHandle: string, podNamespace: string, fragmentPath: string, opts: { json?: boolean; rigRoot?: string; operationId?: string }) => {
+      if (!validOperationId(opts.operationId, opts.json)) return;
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
       if (!daemonStatusGuard(status)) return;
@@ -144,6 +168,10 @@ Examples:
       const received = operationResult(res.data, res.status, opts.operationId, opts.json);
       if (received === undefined) return;
       const data = received.value;
+      if (opts.operationId !== undefined && !usableAddReceiptResult(data)) {
+        malformedOperationResult(opts.operationId, opts.json);
+        return;
+      }
 
       if (opts.json) {
         console.log(JSON.stringify(data, null, 2));

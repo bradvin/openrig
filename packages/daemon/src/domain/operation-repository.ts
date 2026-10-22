@@ -19,6 +19,7 @@ export interface StoredOperationStep {
   evidence: OperationEvidence;
 }
 
+/** Pending or indeterminate external work dominates observed outcomes during recovery. */
 export function aggregateExternalState(steps: StoredOperationStep[], fallback: OperationExternal): OperationExternal {
   const external = steps.filter((step) => step.state === "intent" || step.state === "indeterminate"
     || step.externalOutcome !== undefined);
@@ -76,6 +77,7 @@ export class OperationRepository {
     return inserted === 1;
   }
 
+  /** Reconstruct the public receipt and ordered evidence from their durable rows. */
   read(operationId: string): OperationReceipt | null {
     const row = this.db.prepare("SELECT * FROM operation_receipts WHERE operation_id = ?")
       .get(operationId) as ReceiptRow | undefined;
@@ -100,6 +102,7 @@ export class OperationRepository {
     };
   }
 
+  /** Return recorded steps in execution order for custody and recovery decisions. */
   readSteps(operationId: string): StoredOperationStep[] {
     const rows = this.db.prepare(`SELECT step, kind, target_id, state, external_outcome, evidence_json
       FROM operation_effects WHERE operation_id = ? ORDER BY rowid`).all(operationId) as EffectRow[];
@@ -110,6 +113,7 @@ export class OperationRepository {
       evidence: JSON.parse(row.evidence_json) as OperationEvidence }));
   }
 
+  /** Guard every mutation against an interrupted or differently owned operation. */
   assertRunning(operationId: string, bootId: string): void {
     const row = this.db.prepare("SELECT state, owner_boot_id FROM operation_receipts WHERE operation_id = ?")
       .get(operationId) as { state: string; owner_boot_id: string } | undefined;
@@ -118,6 +122,7 @@ export class OperationRepository {
     }
   }
 
+  /** Persist one committed topology effect or external intent/outcome within its caller's transaction. */
   putStep(operationId: string, step: StoredOperationStep, now: string): void {
     this.db.prepare(`
       INSERT INTO operation_effects (operation_id, step, kind, target_id, state, external_outcome, evidence_json, updated_at)
@@ -130,6 +135,7 @@ export class OperationRepository {
       step.state, step.externalOutcome ?? null, encode(step.evidence), now);
   }
 
+  /** Advance a running receipt only while the current boot still owns it. */
   updateProgress(input: {
     operationId: string; bootId: string; phase: string; target: OperationTarget;
     effect: OperationEffect; external: OperationExternal; now: string;
@@ -142,6 +148,7 @@ export class OperationRepository {
     if (changed !== 1) throw new Error("operation_not_owned_or_running");
   }
 
+  /** Atomically seal the original result and HTTP status for replay. */
   complete(input: {
     operationId: string; bootId: string; phase: string; target: OperationTarget;
     effect: OperationEffect; external: OperationExternal; result: unknown;
@@ -156,6 +163,7 @@ export class OperationRepository {
     if (changed !== 1) throw new Error("operation_not_owned_or_running");
   }
 
+  /** Seal prior-boot running IDs as interrupted without executing their effects again. */
   recoverPriorBoot(bootId: string, now: string): number {
     const tx = this.db.transaction(() => {
       const rows = this.db.prepare(`SELECT * FROM operation_receipts

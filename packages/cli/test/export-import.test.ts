@@ -252,6 +252,25 @@ describe("rig export + import", () => {
     } finally { process.exitCode = prior; }
   });
 
+  it.each(["--instantiate", "--materialize-only"])("import %s rejects malformed IDs without contacting the daemon", async (mode) => {
+    const client = { get: vi.fn(), postText: vi.fn() };
+    const deps = importDeps("version: \"0.2\"\nname: safe\npods: []\nedges: []\n", {
+      clientFactory: () => client as unknown as DaemonClient,
+    });
+    const program = new Command();
+    program.addCommand(importCommand(deps));
+    const prior = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      const logs = await captureLogs(() => program.parseAsync(["node", "rig", "import", "rig.yaml", mode,
+        "--operation-id", "bad-id"]));
+      expect(process.exitCode).toBe(1);
+      expect(logs.join("\n")).toContain("--operation-id must be a UUID");
+      expect(client.get).not.toHaveBeenCalled();
+      expect(client.postText).not.toHaveBeenCalled();
+    } finally { process.exitCode = prior; }
+  });
+
   it.each(["--instantiate", "--materialize-only"])("import %s verifies capability and forwards the operation ID", async (mode) => {
     const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
     const kind = mode === "--instantiate" ? "rig.import" : "rig.materialize";
@@ -275,6 +294,31 @@ describe("rig export + import", () => {
       expect.any(String), "text/yaml", expect.objectContaining({ "X-OpenRig-Operation-Id": id }),
       ...(mode === "--instantiate" ? [{ timeoutMs: 120_000 }] : []),
     );
+  });
+
+  it.each(["--instantiate", "--materialize-only"])("import %s refuses malformed completed nodes without throwing", async (mode) => {
+    const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
+    const kind = mode === "--instantiate" ? "rig.import" : "rig.materialize";
+    const client = { get: vi.fn(async () => ({ status: 200, data: {
+      contract: "operations.v1", kinds: [kind] } })),
+    postText: vi.fn(async () => ({ status: 201, data: {
+      operation: { operationId: id, state: "completed", effect: "committed" },
+      result: { rigId: "rig-1", specName: "safe", nodes: "bad" },
+    } })) };
+    const deps = importDeps("version: \"0.2\"\nname: safe\npods: []\nedges: []\n", {
+      clientFactory: () => client as unknown as DaemonClient,
+    });
+    const program = new Command();
+    program.addCommand(importCommand(deps));
+    const prior = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      const logs = await captureLogs(() => program.parseAsync(["node", "rig", "import", "rig.yaml", mode,
+        "--operation-id", id]));
+      expect(process.exitCode).toBe(1);
+      expect(logs.join("\n")).toContain("malformed result");
+      expect(client.postText).toHaveBeenCalledTimes(1);
+    } finally { process.exitCode = prior; }
   });
 
   it.each(["--instantiate", "--materialize-only"])("import %s reports a failed 200 replay without reading absent nodes", async (mode) => {

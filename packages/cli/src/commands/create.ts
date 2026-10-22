@@ -6,7 +6,7 @@ import { getDaemonStatus, getDaemonUrl, daemonStatusGuard } from "../daemon-life
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 import { resolveDefaultAgentRef } from "./topology-default-agent.js";
-import { operationResult, requireOperationCapability } from "./operation.js";
+import { malformedOperationResult, operationResult, requireOperationCapability, validOperationId } from "./operation.js";
 
 interface CreateResult {
   rigId: string;
@@ -24,6 +24,7 @@ interface CreateResult {
   error?: string;
 }
 
+/** Create a one-seat rig; an opted-in retry must prove daemon support and return its own receipt. */
 export function createCommand(depsOverride?: StatusDeps): Command {
   const cmd = new Command("create").description("Create a one-seat rig without writing a spec");
   const getDeps = () => depsOverride ?? {
@@ -38,6 +39,7 @@ export function createCommand(depsOverride?: StatusDeps): Command {
     .option("--json", "JSON output for agents")
     .option("--operation-id <uuid>", "Durable retry identity for this create")
     .action(async (name: string, opts: { runtime: string; cwd: string; json?: boolean; operationId?: string }) => {
+      if (!validOperationId(opts.operationId, opts.json)) return;
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
       if (!daemonStatusGuard(status)) return;
@@ -84,10 +86,20 @@ export function createCommand(depsOverride?: StatusDeps): Command {
       const result = operationResult(res.data, res.status, opts.operationId, opts.json);
       if (result === undefined) return;
       res.data = result.value;
-      const node = res.data.nodes?.find((candidate) => candidate.logicalId === logicalId);
+      // Receipt payloads cross a network boundary despite the static response type.
+      if (opts.operationId !== undefined && result.status < 400 &&
+        (typeof res.data.rigId !== "string" || !Array.isArray(res.data.nodes)
+          || res.data.nodes.some((candidate) => !candidate || typeof candidate !== "object"
+            || typeof candidate.logicalId !== "string" || typeof candidate.status !== "string"))) {
+        malformedOperationResult(opts.operationId, opts.json);
+        return;
+      }
+      const node = Array.isArray(res.data.nodes)
+        ? res.data.nodes.find((candidate) => candidate && typeof candidate === "object" && candidate.logicalId === logicalId)
+        : undefined;
       const ok = result.status < 400 && node?.status === "launched";
       // The same reason in both outputs, under the key `rig grow --json` uses.
-      const detail = ok ? undefined : (res.data.errors?.join("; ")
+      const detail = ok ? undefined : ((Array.isArray(res.data.errors) ? res.data.errors.join("; ") : undefined)
         ?? res.data.message
         ?? res.data.error
         ?? node?.error

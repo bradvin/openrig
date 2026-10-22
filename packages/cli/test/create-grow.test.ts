@@ -65,6 +65,61 @@ const library = [{
 afterEach(() => vi.restoreAllMocks());
 
 describe("rig create", () => {
+  it("rejects a malformed operation ID before capability and write requests", async () => {
+    const client = { get: vi.fn(), postText: vi.fn() };
+    const program = createProgram({ createDeps: deps(client) });
+    program.exitOverride();
+    const output = await captureLogs(() => program.parseAsync([
+      "node", "rig", "create", "alpha", "--operation-id", "bad-id", "--json",
+    ]));
+    expect(output.exitCode).toBe(1);
+    expect(JSON.parse(output.logs.join("\n"))).toMatchObject({ ok: false, error: "invalid_operation_id" });
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.postText).not.toHaveBeenCalled();
+  });
+  it("reports a conflicting retry without presenting the original rig as newly created", async () => {
+    const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
+    const client = {
+      get: vi.fn(async (path: string) => path === "/api/operations/capabilities"
+        ? { status: 200, data: { contract: "operations.v1", kinds: ["rig.import"] } }
+        : { status: 200, data: library }),
+      postText: vi.fn(async () => ({ status: 409, data: { error: "operation_id_conflict",
+        operation: { operationId: id, state: "completed", effect: "committed",
+          result: { rigId: "original-rig", nodes: [{ logicalId: "main.lead", status: "launched" }] } } } })),
+    };
+    const program = createProgram({ createDeps: deps(client) });
+    program.exitOverride();
+    const output = await captureLogs(() => program.parseAsync([
+      "node", "rig", "create", "new-rig", "--operation-id", id, "--json",
+    ]));
+    expect(output.exitCode).toBe(1);
+    expect(JSON.parse(output.logs.join("\n"))).toMatchObject({ ok: false,
+      error: "operation_id_conflict", operation: { operationId: id } });
+    expect(client.postText).toHaveBeenCalledTimes(1);
+    expect(output.logs.join("\n")).not.toContain("Created rig");
+  });
+  it.each([false, true])("refuses malformed completed create nodes without throwing (json=%s)", async (json) => {
+    const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
+    const client = {
+      get: vi.fn(async (path: string) => path === "/api/operations/capabilities"
+        ? { status: 200, data: { contract: "operations.v1", kinds: ["rig.import"] } }
+        : { status: 200, data: library }),
+      postText: vi.fn(async () => ({ status: 201, data: {
+        operation: { operationId: id, state: "completed", effect: "committed" },
+        result: { rigId: "rig-1", specName: "alpha", nodes: "bad" },
+      } })),
+    };
+    const program = createProgram({ createDeps: deps(client) });
+    program.exitOverride();
+    const output = await captureLogs(() => program.parseAsync([
+      "node", "rig", "create", "alpha", "--operation-id", id, ...(json ? ["--json"] : []),
+    ]));
+    expect(output.exitCode).toBe(1);
+    expect(output.logs.join("\n")).toContain("malformed result");
+    if (json) expect(JSON.parse(output.logs.join("\n"))).toMatchObject({ ok: false,
+      error: "invalid_operation_receipt" });
+    expect(client.postText).toHaveBeenCalledTimes(1);
+  });
   it("sends an operation ID and reads the wrapped result", async () => {
     const id = "ea7e6a21-b25b-41e2-947e-8554d086ef2a";
     const client = {

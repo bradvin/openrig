@@ -25,6 +25,7 @@ class OperationJournalFailure extends Error {
   }
 }
 
+/** Keep journal failures distinct so the caller cannot treat an unrecorded effect as recoverable success. */
 function recordOperationEffect(operation: OperationContext, input: Parameters<OperationContext["service"]["commitEffectWithinTransaction"]>[0]): void {
   try { operation.service.commitEffectWithinTransaction(input); }
   catch (error) { throw new OperationJournalFailure(error); }
@@ -78,6 +79,7 @@ export class RigInstantiator {
     this.tmuxAdapter = deps.tmuxAdapter;
   }
 
+  /** Journal legacy topology in its owning transaction and each launch before external execution. */
   async instantiate(spec: RigSpec, opts?: { nonInterruptive?: boolean; env?: SeatEnv; operation?: OperationContext }): Promise<InstantiateOutcome> {
     // 1. Validate
     const raw = RigSpecCodec.parse(RigSpecCodec.serialize(spec));
@@ -626,6 +628,7 @@ export class PodRigInstantiator {
     };
   }
 
+  /** Validate a YAML spec before handing its optional receipt to the transactional topology path. */
   async materialize(
     rigSpecYaml: string,
     rigRoot: string,
@@ -1442,6 +1445,7 @@ export class PodRigInstantiator {
     return { ok: true, rigId, nodeId, logicalId: node.logicalId, status: "launched", sessionName: result.sessionName, warnings: result.warnings };
   }
 
+  /** Serialize same-name imports before receipt-bearing topology and launch work begins. */
   async instantiate(rigSpecYaml: string, rigRoot: string, opts?: { nonInterruptive?: boolean; cwdOverride?: string; env?: SeatEnv; installRoot?: string; force?: boolean; operation?: OperationContext; prelaunchHook?: (rigId: string, replacedRigIds: readonly string[]) => Promise<{ ok: true; rollback?: () => Promise<void> } | { ok: false; code: string; message: string; retainRig?: boolean }> }): Promise<InstantiateOutcome> {
     // #141: while an import may archive a stopped same-name generation, allow one import per rig name at
     // a time on this daemon. Otherwise two imports could each replace it, or one could archive the other's
@@ -1468,6 +1472,7 @@ export class PodRigInstantiator {
     }
   }
 
+  /** Carry one accepted receipt through topology, external launch, and compensation boundaries. */
   private async instantiateOnce(rigSpecYaml: string, rigRoot: string, opts?: { nonInterruptive?: boolean; cwdOverride?: string; env?: SeatEnv; installRoot?: string; force?: boolean; operation?: OperationContext; prelaunchHook?: (rigId: string, replacedRigIds: readonly string[]) => Promise<{ ok: true; rollback?: () => Promise<void> } | { ok: false; code: string; message: string; retainRig?: boolean }> }): Promise<InstantiateOutcome> {
     // 1. Parse + validate
     let rigSpec: PodRigSpec;
@@ -2086,6 +2091,7 @@ export class PodRigInstantiator {
     return order;
   }
 
+  /** Journal terminal node creation and the uncertain launch before reporting readiness. */
   private async processTerminalMember(
     rigId: string,
     rigSpec: PodRigSpec,
@@ -2799,6 +2805,7 @@ export class PodRigInstantiator {
     };
   }
 
+  /** Preserve launch uncertainty when the terminal delivery guard runs an existing member. */
   private async launchExistingTerminalMember(input: {
     rigId: string;
     rigSpec: PodRigSpec;

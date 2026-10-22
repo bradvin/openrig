@@ -5,6 +5,7 @@ import type Database from "better-sqlite3";
 // transactional identity checks remain the cross-process authority.
 const lanes = new WeakMap<Database.Database, Map<string, Promise<void>>>();
 
+/** Serialize same-target async work in this process; SQLite remains the durable authority. */
 export async function runOperationMutation<T>(db: Database.Database, key: string,
   work: () => Promise<T>): Promise<T> {
   let byKey = lanes.get(db);

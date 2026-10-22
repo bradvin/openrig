@@ -31,6 +31,7 @@ export type Reservation =
   | { kind: "reserved"; receipt: OperationReceipt }
   | { kind: "in_flight" | "replayed" | "conflict"; receipt: OperationReceipt };
 
+/** Canonicalize request data and reject unsupported values before hashing retry identity. */
 function stableValue(value: unknown, depth = 0): unknown {
   if (depth > 32) throw new Error("operation_request_too_deep");
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
@@ -47,16 +48,19 @@ function stableValue(value: unknown, depth = 0): unknown {
   throw new Error("unsupported_operation_value");
 }
 
+/** Parse YAML once with unique keys so equivalent retry requests hash alike. */
 export function parseOperationYaml(source: string): unknown {
   const value = YAML.parse(source, { uniqueKeys: true });
   return stableValue(value);
 }
 
+/** Resolve the behavior-changing root before it enters the request hash. */
 export function normalizedOperationRoot(root: string): string {
   if (!root.trim()) throw new Error("operation_root_required");
   return resolve(root);
 }
 
+/** Bind an ID to the full mutation request, including options that change effects. */
 export function operationRequestHash(request: Pick<OperationRequest, "kind" | "targetIds" | "payload" | "options">): string {
   const canonical = JSON.stringify(stableValue({ contractVersion: 1, kind: request.kind,
     targetIds: request.targetIds, payload: request.payload, options: request.options }));
@@ -72,6 +76,7 @@ function safeStep(value: string): void {
   if (!STEP.test(value)) throw new Error("invalid_operation_step");
 }
 
+/** Limit receipts to opaque IDs and references; arbitrary payloads cannot enter durable evidence. */
 function safeEvidence(evidence: OperationEvidence): OperationEvidence {
   if (Object.keys(evidence).some((key) => key !== "ids" && key !== "referenceIds")) {
     throw new Error("operation_evidence_not_allowed");
@@ -87,6 +92,7 @@ function safeEvidence(evidence: OperationEvidence): OperationEvidence {
   return out;
 }
 
+/** Bound receipt targets to stable resource IDs for later inspection. */
 function safeTarget(target: OperationTarget): OperationTarget {
   if (target.rigId !== undefined) safeId(target.rigId, "operation_rig_id");
   if (target.podId !== undefined) safeId(target.podId, "operation_pod_id");
@@ -104,6 +110,7 @@ export class OperationService {
     this.bootId = bootId;
   }
 
+  /** Atomically claim a new ID or classify a same-ID retry without repeating effects. */
   reserve(request: OperationRequest): Reservation {
     if (!UUID.test(request.operationId)) throw new Error("invalid_operation_id");
     if (!["rig.create", "rig.import", "rig.materialize", "member.add"].includes(request.kind)) {
@@ -123,6 +130,7 @@ export class OperationService {
     return tx.immediate();
   }
 
+  /** Read one validated ID without changing its state or re-running its work. */
   read(operationId: string): OperationReceipt | null {
     if (!UUID.test(operationId)) throw new Error("invalid_operation_id");
     return this.repository.read(operationId);
@@ -223,6 +231,7 @@ export class OperationService {
     this.repository.complete({ ...input, target, result, bootId: this.bootId, now: this.now() });
   }
 
+  /** Convert stranded prior-boot work to inspectable, non-retryable receipts. */
   recoverInterrupted(): number {
     return this.repository.recoverPriorBoot(this.bootId, this.now());
   }

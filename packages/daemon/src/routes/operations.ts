@@ -14,6 +14,7 @@ export function operationId(c: Context): string | undefined {
   return value === undefined ? undefined : value;
 }
 
+/** Return the same public result shape for first completion and same-request replay. */
 export function operationHttp(receipt: OperationReceipt, status: number, replayed = false): Response {
   return new Response(JSON.stringify({ operation: receipt,
     ...(receipt.result === undefined ? {} : { result: receipt.result }),
@@ -23,6 +24,7 @@ export function operationHttp(receipt: OperationReceipt, status: number, replaye
   });
 }
 
+/** Stop conflicting and in-flight retries before route-specific mutation work begins. */
 export function reservationHttp(reservation: Reservation): Response | null {
   if (reservation.kind === "reserved") return null;
   if (reservation.kind === "conflict") return new Response(JSON.stringify({
@@ -32,6 +34,7 @@ export function reservationHttp(reservation: Reservation): Response | null {
     reservation.kind === "replayed");
 }
 
+/** Seal a failed result to keep an accepted ID from becoming uninspectable. */
 export function operationFailureHttp(service: OperationService, operationId: string,
   status = 500): Response {
   const receipt = service.repository.db.transaction(() => {

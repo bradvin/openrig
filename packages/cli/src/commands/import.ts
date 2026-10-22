@@ -5,7 +5,7 @@ import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
-import { operationResult, requireOperationCapability } from "./operation.js";
+import { malformedOperationResult, operationResult, requireOperationCapability, validOperationId } from "./operation.js";
 
 export interface ImportDeps extends StatusDeps {
   readFile: (path: string) => string;
@@ -13,6 +13,24 @@ export interface ImportDeps extends StatusDeps {
 
 const LONG_RUNNING_IMPORT_TIMEOUT_MS = 120_000;
 
+/** Check fields this command iterates or joins before trusting an opted-in receipt. */
+function usableImportReceiptResult(value: unknown, status: number): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const data = value as Record<string, unknown>;
+  if (data.errors !== undefined && (!Array.isArray(data.errors)
+    || data.errors.some((error) => typeof error !== "string"))) return false;
+  if (status >= 400 || data.code !== undefined) return true;
+  return typeof data.rigId === "string" && Array.isArray(data.nodes)
+    && data.nodes.every((node) => {
+      if (!node || typeof node !== "object" || Array.isArray(node)) return false;
+      const row = node as Record<string, unknown>;
+      return typeof row.logicalId === "string" && typeof row.status === "string";
+    })
+    && (data.warnings === undefined || (Array.isArray(data.warnings)
+      && data.warnings.every((warning) => typeof warning === "string")));
+}
+
+/** Route create/materialize imports through the receipt contract when a retry ID is supplied. */
 export function importCommand(depsOverride?: ImportDeps): Command {
   const cmd = new Command("import").description("Import a rig spec from YAML");
   const getDeps = (): ImportDeps => depsOverride ?? {
@@ -32,6 +50,7 @@ export function importCommand(depsOverride?: ImportDeps): Command {
     .option("--cwd <path>", "Override launch/materialization working directory for all members")
     .option("--operation-id <uuid>", "Durable retry identity for --instantiate or --materialize-only")
     .action(async (filePath: string, opts: { instantiate?: boolean; materializeOnly?: boolean; workspaceOnly?: boolean; preflight?: boolean; targetRig?: string; rigRoot?: string; cwd?: string; operationId?: string }) => {
+      if (!validOperationId(opts.operationId)) return;
       const deps = getDeps();
 
       // Read local file first (before daemon check — fail fast on missing file)
@@ -141,6 +160,10 @@ export function importCommand(depsOverride?: ImportDeps): Command {
         const result = operationResult(res.data, res.status, opts.operationId);
         if (result === undefined) return;
         res.data = result.value;
+        if (opts.operationId !== undefined && !usableImportReceiptResult(res.data, result.status)) {
+          malformedOperationResult(opts.operationId);
+          return;
+        }
         if (result.status === 409 || result.status === 400 || result.status === 404 || "code" in res.data) {
           const data = res.data as { ok?: false; code?: string; errors?: string[]; message?: string; error?: string };
           if (data.code === "rig_name_running") {
@@ -177,6 +200,10 @@ export function importCommand(depsOverride?: ImportDeps): Command {
         const result = operationResult(res.data, res.status, opts.operationId);
         if (result === undefined) return;
         res.data = result.value;
+        if (opts.operationId !== undefined && !usableImportReceiptResult(res.data, result.status)) {
+          malformedOperationResult(opts.operationId);
+          return;
+        }
         if (result.status === 409 || result.status === 400 || "code" in res.data) {
           const data = res.data as { ok: false; code: string; errors?: string[]; message?: string; error?: string };
           if (data.code === "rig_name_running") {

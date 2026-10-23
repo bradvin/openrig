@@ -322,8 +322,8 @@ rigsRoutes.post("/:id/launch-plan", async (c) => {
 rigsRoutes.post("/", async (c) => {
   const header = c.req.header("X-OpenRig-Operation-Id");
   if (!validOperationId(header)) return c.json({ error: "Invalid X-OpenRig-Operation-Id" }, 400);
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
   const text = await c.req.text();
-  const body: Record<string, unknown> = (() => { try { return JSON.parse(text); } catch { return {}; } })();
   const name = body["name"];
   if (!name || typeof name !== "string") {
     return c.json({ error: "name is required" }, 400);
@@ -831,8 +831,8 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
     return c.json({ error: "Pod instantiator not available" }, 500);
   }
 
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
   const text = await c.req.text();
-  const body: Record<string, unknown> = (() => { try { return JSON.parse(text); } catch { return {}; } })();
   const member = body["member"];
   if (!member || typeof member !== "object" || Array.isArray(member)) {
     return c.json({ error: "member is required (a member fragment with id, runtime, agent_ref)" }, 400);

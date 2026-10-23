@@ -233,8 +233,10 @@ New managed agents and handover successors on macOS/Linux start from the daemon'
 selected launch environment and declared seat values, rather than stored tmux globals.
 Values named by tmux's `update-environment` option, including its default SSH-agent
 and display variables, come from the daemon's environment.
-Normal shell startup and configured tmux shell commands still run. If your custom setup
-intentionally supplies values through tmux's global environment, opt in with
+Normal shell startup and configured tmux shell commands still run. OpenRig reasserts its
+selected `OPENRIG_DB` and configured `TMUX_TMPDIR` when starting the runtime after shell startup.
+If your custom setup intentionally supplies values through tmux's global environment,
+opt in with
 `rig config set terminal.inherit_tmux_environment true`. Setup points out this option
 when it detects custom tmux configuration; it never enables it automatically. The setting
 applies to future launches and successors, not running agents or your personal tmux server.
@@ -475,6 +477,11 @@ rig terminal open saved:kernel --provider cmux --json
 ```
 
 Use `rig terminal status --json` to inspect provider availability and liveness.
+To keep rigs in separate Herdr sessions, select one explicitly:
+`rig terminal open future-prod-rig --provider herdr --session future-prod`.
+`--session default` selects Herdr's default session; omitting the option keeps
+the daemon's configured endpoint. See [named terminal sessions](terminal-sessions.md)
+for desktop windows, previews and session-specific status.
 For the first desktop handoff, use `--window`. Only if the window cannot open,
 `rig tui --shared` is the dashboard-only fallback, not the operator's conversation.
 

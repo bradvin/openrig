@@ -24,6 +24,7 @@ import type { PiResumeAdapter } from "../adapters/pi-resume.js";
 import type { OmpResumeAdapter } from "../adapters/omp-resume.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { assessNativeResumeProbe } from "./native-resume-probe.js";
+import { resumeProbeEvidence, type NativeResumeProbeEvidence } from "./native-resume-probe-evidence.js";
 import { observeClaudeDelivery, observeClaudeResumeLaunch, verifyClaudePaneProcess, verifyPaneIdleShell, type ClaudeLaunchedProcess } from "./native-process-lineage.js";
 import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry } from "./builtin-startup-files.js";
 import { seatGuidance, restoreMissingGuidance, missingGuidanceBlocks } from "./restore-guidance.js";
@@ -72,6 +73,8 @@ export type ReconcileNodeResult =
         | "resume_token_not_used"
         | "pane_not_usable";
       detail: string;
+      probe?: NativeResumeProbeEvidence;
+      attemptId?: number;
     };
 
 // Only these edge kinds constrain launch order
@@ -81,7 +84,7 @@ const LAUNCH_DEPENDENCY_KINDS = new Set(["delegates_to", "spawned_by"]);
 // in the pure leaf module active-occupant.ts, shared with preview, snapshot
 // usability, and lifecycle projection. Imported and re-exported here so the
 // existing export surface and the execution call sites below are unchanged.
-import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError } from "./active-occupant.js";
+import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError, freshSeatLaunchCommand } from "./active-occupant.js";
 import { effectiveRestorePolicy, type RestoreSeatFacts } from "./restore-policy.js";
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
@@ -1031,7 +1034,7 @@ export class RestoreOrchestrator {
           nodeId,
           logicalId: node.logicalId,
           status: "awaiting-decision",
-          error: `Resume is unsupported for community harness "${node.runtime}": its preset is launch-only. No session was started, and the earlier conversation is left as it is. Re-run with --fresh ${node.logicalId} only if you want a new conversation.`,
+          error: `Resume is unsupported for community harness "${node.runtime}": its preset is launch-only. No session was started, and the earlier conversation is left as it is. Only if you want a new conversation, run: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
         };
       }
       if (policy === "resume_if_possible" && snapSession && !snapSession.resumeToken && !freshRequested) {
@@ -1042,7 +1045,7 @@ export class RestoreOrchestrator {
           nodeId,
           logicalId: node.logicalId,
           status: "awaiting-decision",
-          error: `Original session unresumable: ${sourceNote}. No session was started. Re-run with --fresh ${node.logicalId} to deliberately start a fresh-primed seat, or restore the original session manually.`,
+          error: `Original session unresumable: ${sourceNote}. No session was started. Restore the original session manually, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
         };
       }
     }
@@ -1255,6 +1258,11 @@ export class RestoreOrchestrator {
     }
   }
 
+  /** The one-seat command a restore reason names for a seat left awaiting a decision. */
+  private freshSeatCommand(rigId: string, data: SnapshotData, logicalId: string): string {
+    return freshSeatLaunchCommand(logicalId, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name);
+  }
+
   private async postLaunchRestore(
     entry: PlanEntry,
     rigId: string,
@@ -1379,7 +1387,7 @@ export class RestoreOrchestrator {
         // just-created session is a confirmed blank (no resume was possible) —
         // roll back to zero sessions and present the decision honestly.
         await this.rollbackToZeroSession(node.id, sessionName, launchResult?.session.id, priorState);
-        return { nodeId: node.id, logicalId: node.logicalId, status: "awaiting-decision", error: `Original session unresumable: resume requested but no token available. No session is running. Re-run with --fresh ${node.logicalId} for a deliberate fresh-primed seat, or restore the original session manually.` };
+        return { nodeId: node.id, logicalId: node.logicalId, status: "awaiting-decision", error: `Original session unresumable: resume requested but no token available. No session is running. Restore the original session manually, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.` };
       } else {
         const launchedSessionId = launchResult?.session.id;
         if (launchedSessionId && this.claudeResume.canResume(resumeType, resumeToken)) {
@@ -1417,7 +1425,7 @@ export class RestoreOrchestrator {
           // a confirmed blank agent (precision guard trigger (i)). Roll back to
           // zero sessions; the stop-and-ask is realized as awaiting-decision.
           await this.rollbackToZeroSession(node.id, sessionName, launchResult?.session.id, priorState);
-          return { nodeId: node.id, logicalId: node.logicalId, status: "awaiting-decision", error: `Original session unresumable: resume attempted but failed. The blank session was rolled back; no session is running. Re-run with --fresh ${node.logicalId} for a deliberate fresh-primed seat, or check the harness state manually.` };
+          return { nodeId: node.id, logicalId: node.logicalId, status: "awaiting-decision", error: `Original session unresumable: resume attempted but failed. The blank session was rolled back; no session is running. Check the harness state manually, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.` };
         }
       }
     } else if (resumeRequested && isPodAware) {
@@ -1431,7 +1439,7 @@ export class RestoreOrchestrator {
           nodeId: node.id,
           logicalId: node.logicalId,
           status: "awaiting-decision",
-          error: `Original session unresumable: resume requested but no token available. No session is running. Re-run with --fresh ${node.logicalId} for a deliberate fresh-primed seat, or restore the original session manually.`,
+          error: `Original session unresumable: resume requested but no token available. No session is running. Restore the original session manually, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
         };
       }
       // OPR.0.4.3.20 FR-7 (Gap 2b) — a pod-aware resume needs the runtime adapter
@@ -1447,7 +1455,7 @@ export class RestoreOrchestrator {
           nodeId: node.id,
           logicalId: node.logicalId,
           status: "awaiting-decision",
-          error: `Original session unresumable: resume requested but runtime continuity could not be verified (no ${node.runtime ?? "runtime"} adapter available). No session is running. Re-run with --fresh ${node.logicalId} for a deliberate fresh-primed seat, or retry restore with runtime adapters.`,
+          error: `Original session unresumable: resume requested but runtime continuity could not be verified (no ${node.runtime ?? "runtime"} adapter available). No session is running. Retry the restore with runtime adapters, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
         };
       }
     }
@@ -1626,7 +1634,7 @@ export class RestoreOrchestrator {
                   nodeId: node.id,
                   logicalId: node.logicalId,
                   status: "awaiting-decision",
-                  error: `Original session unresumable: resume attempted but the runtime reported fresh continuity. The blank session was rolled back; no session is running. Re-run with --fresh ${node.logicalId} if that degradation is acceptable.`,
+                  error: `Original session unresumable: resume attempted but the runtime reported fresh continuity. The blank session was rolled back; no session is running. If that degradation is acceptable, start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
                 };
               }
               const finalStatus = (isPodAware && resumeRequested)
@@ -1666,7 +1674,7 @@ export class RestoreOrchestrator {
                   nodeId: node.id,
                   logicalId: node.logicalId,
                   status: "awaiting-decision",
-                  error: `Original session unresumable: ${startupResult.errors.join("; ")}. The blank session was rolled back; no session is running. Re-run with --fresh ${node.logicalId} to deliberately start a fresh-primed seat, or restore the original session manually.`,
+                  error: `Original session unresumable: ${startupResult.errors.join("; ")}. The blank session was rolled back; no session is running. Restore the original session manually, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
                 };
               }
               return {
@@ -2161,12 +2169,13 @@ export class RestoreOrchestrator {
     // Precondition #4: pane is at a usable/idle state — explicitly NOT a
     // resume-selection prompt and not the "returned to shell" failure mode.
     if (probe.status !== "resumed") {
+      const evidence = await resumeProbeEvidence(probe, paneContent, this.tmuxAdapter, identity.pane);
       // The label reads as a shell, but the runtime's lineage was just proven in this pane: name a shell only for a proven idle one.
       if (probe.code === "returned_to_shell" && !await verifyPaneIdleShell({ target: identity.pane, tmux: this.tmuxAdapter,
         ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}) })) {
-        return { ok: false, code: "pane_not_usable", detail: "Pane is not shown to be resumed: its command reads as a shell, but it is not a proven idle shell (the runtime may be starting or showing a dialog); reconciliation requires resumed." };
+        return { ok: false, code: "pane_not_usable", probe: evidence, attemptId, detail: "Pane is not shown to be resumed: its command reads as a shell, but it is not a proven idle shell (the runtime may be starting or showing a dialog); reconciliation requires resumed." };
       }
-      return { ok: false, code: "pane_not_usable", detail: `Pane state is ${probe.status} (${probe.code}); reconciliation requires resumed.` };
+      return { ok: false, code: "pane_not_usable", probe: evidence, attemptId, detail: `Pane state is ${probe.status} (${probe.code}); reconciliation requires resumed.` };
     }
 
     // All four preconditions hold. Append (never mutate) the audit event.

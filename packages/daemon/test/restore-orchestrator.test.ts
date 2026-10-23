@@ -35,6 +35,9 @@ import { buildRestorePlanPreview } from "../src/domain/restore-plan-preview.js";
 import { AppliedLaunchObservationStore } from "../src/domain/applied-launch-observation-store.js";
 import { observeClaudePermission, observeCodexSandbox, observePiResourceTrust, observeOmpApprovalMode, type AppliedLaunchObservation } from "../src/domain/permission-drift.js";
 import { SeatIdentityReconciler } from "../src/domain/seat-identity-reconciler.js";
+import { createHash } from "node:crypto";
+import { SeatAttentionReconciler } from "../src/domain/seat-attention-reconciler.js";
+import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 
 function setupDb(): Database.Database {
   return createFullTestDb();
@@ -2596,6 +2599,9 @@ describe("RestoreOrchestrator", () => {
       expect(nodeResult!.status).toBe("awaiting-decision");
       expect(nodeResult!.error).toContain("Original session unresumable");
       expect(nodeResult!.error).toContain("The blank session was rolled back; no session is running");
+      // The one-seat command, not a whole-rig re-run, which is refused while sibling seats run.
+      expect(nodeResult!.error).toContain(`deliberately start only this seat fresh: rig seat launch '${node.logicalId}@test-rig' --fresh --reason "<why>".`);
+      expect(nodeResult!.error).not.toContain("Re-run with --fresh");
       expect(launchHarness).toHaveBeenCalledTimes(1);
       expect(launchHarness.mock.calls[0]![1].resumeToken).toBe("stale-claude-token");
 
@@ -2755,7 +2761,7 @@ describe("RestoreOrchestrator", () => {
     if (result.ok) {
       const nodeResult = result.result.nodes.find((n) => n.nodeId === node.id);
       expect(nodeResult!.status).toBe("awaiting-decision");
-      expect(nodeResult!.error).toBe(`Resume is unsupported for community harness "synth-harness": its preset is launch-only. No session was started, and the earlier conversation is left as it is. Re-run with --fresh dev.impl only if you want a new conversation.`);
+      expect(nodeResult!.error).toBe(`Resume is unsupported for community harness "synth-harness": its preset is launch-only. No session was started, and the earlier conversation is left as it is. Only if you want a new conversation, run: rig seat launch 'dev.impl@test-rig' --fresh --reason "<why>".`);
       expect(launchHarness).not.toHaveBeenCalled();
     }
   });
@@ -3915,6 +3921,50 @@ describe("RestoreOrchestrator", () => {
       expect(tmux.sendText).not.toHaveBeenCalled();
     });
 
+    it.each(["available", "error", "timeout"] as const)("persists the strict attention refusal probe with geometry=%s (#1480)", async geometry => {
+      const missingGeometry = geometry !== "available";
+      const tmux = mockTmuxForReconciler();
+      const content = "❯ fixture-private-restore-prompt\n● OAuth token revoked · Please run /login\n\n❯";
+      vi.mocked(tmux.hasSession).mockResolvedValue(true);
+      vi.mocked(tmux.getPaneCommand).mockResolvedValue("sh");
+      let captured = false;
+      vi.mocked(tmux.capturePaneContent).mockImplementation(async () => { captured = true; return content; });
+      // Identity resolves before capture; fail only the later diagnostic geometry read.
+      const listPanes = tmux.listPanes;
+      tmux.listPanes = async (...args) => {
+        if (geometry === "timeout" && captured) return new Promise<never>(() => {});
+        if (geometry === "error" && captured) throw new Error("fixture-private-geometry-error");
+        return listPanes(...args);
+      };
+      const seeded = seedFailedAttempt({ restoreOutcome: "attention_required", withResumeToken: true });
+      sessionRegistry.updateStartupStatus(sessionRegistry.getSessionsForRig(seeded.rig.id)[0]!.id, "ready");
+      const before = db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").get();
+      const attempt = db.prepare("SELECT seq FROM events WHERE type = 'restore.started'").get() as { seq: number };
+      const restore = createOrchestrator({ tmux, listProcesses: async () => managedClaudeRows("tok-abc-123") });
+      const reconciler = new SeatAttentionReconciler({ db, sessionRegistry, eventBus,
+        agentActivityStore: new AgentActivityStore({ db, eventBus }),
+        reconcileRestoreOutcome: (rigId, nodeId) => restore.reconcileNodeRuntimeTruth(rigId, nodeId),
+      });
+      const result = await reconciler.clearAttention(seeded.sessionName, { reason: "operator explanation" });
+      expect(result).toMatchObject({ ok: false, code: "not_demonstrably_responsive",
+        detail: expect.stringContaining("pane_not_usable: Pane state is failed (login_required)") });
+      const events = db.prepare("SELECT payload FROM events WHERE type = 'seat.attention_clear_refused'").all() as { payload: string }[];
+      expect(events).toHaveLength(1);
+      expect(JSON.parse(events[0]!.payload)).toEqual({ type: "seat.attention_clear_refused", rigId: seeded.rig.id, nodeId: seeded.nodeId,
+        sessionId: sessionRegistry.getSessionsForRig(seeded.rig.id)[0]!.id,
+        sessionName: seeded.sessionName, attentionClass: "restore_outcome", code: "pane_not_usable", attemptId: attempt.seq,
+        probe: { status: "failed", code: "login_required",
+          loginRefusal: { message: "OAuth token revoked · Please run /login", row: "response" },
+          capture: { lines: 4, bytes: Buffer.byteLength(content), sha256: createHash("sha256").update(content).digest("hex"),
+            columns: missingGeometry ? null : 80, rows: missingGeometry ? null : 24 } },
+      });
+      expect(events[0]!.payload).not.toContain("fixture-private");
+      expect(db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").get()).toEqual(before);
+      expect(db.prepare("SELECT * FROM events WHERE type IN ('restore.outcome_reconciled', 'seat.attention_cleared')").all()).toHaveLength(0);
+      expect(tmux.sendText).not.toHaveBeenCalled();
+      expect(tmux.sendKeys).not.toHaveBeenCalled();
+    });
+
     // #1077 — the seat launched with --resume tok-abc-123 and Claude continued as a new id. The
     // strict reconciler keeps main's exact current-token path and accepts the launch token only as
     // the alternative a qualified rotation names: the launched process's own first hook, a resume.
@@ -4260,7 +4310,7 @@ describe("RestoreOrchestrator", () => {
       if (!result.ok) return;
       const node = result.result.nodes[0]!;
       expect(node.status).toBe("awaiting-decision");
-      expect(node.error).toContain("--fresh worker");
+      expect(node.error).toMatch(/rig seat launch 'worker@[^']+' --fresh --reason "<why>"/);
       // ZERO session started: launchNode never called, session count unchanged.
       expect(launchSpy).not.toHaveBeenCalled();
       expect(after.c).toBe(before.c);

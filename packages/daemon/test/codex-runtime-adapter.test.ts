@@ -57,7 +57,7 @@ function mockFs(files?: Record<string, string>): CodexAdapterFsOps {
   } as CodexAdapterFsOps & { _store: Record<string, string> };
 }
 
-/** Fake the adapter's production statMode seam for Codex project-root markers. */
+/** Model file and directory Git markers through the adapter's filesystem seam. */
 function mockProjectFs(files: Record<string, string>, markers: Record<string, "file" | "directory">): CodexAdapterFsOps {
   const ops = mockFs(files);
   const exists = ops.exists;

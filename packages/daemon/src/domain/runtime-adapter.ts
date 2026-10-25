@@ -15,6 +15,8 @@ export interface NodeBinding extends Binding {
   advisor?: string;
   codexConfigProfile?: string;
   claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules;
+  /** A Codex seat's own permission envelope, read live; emitted instead of the posture decision. */
+  codexPermissions?: import("./codex-member-permissions.js").CodexMemberPermissions;
   /** Rebuild only: a process/conversation-bound native predecessor policy. */
   codexRebuildPermissions?: import("./codex-rebuild-permissions.js").CodexPermissionEnvelope;
   /** OPR.0.4.8.3 Seam B: the seat's RESOLVED launch posture from its permission_policy
@@ -98,6 +100,8 @@ export const ATTENTION_REQUIRED_READINESS_CODES = new Set([
   "login_required",
   "mcp_gate",
   "bypass_consent_gate",
+  // Claude's resume chooser or picker waits for a person to choose a conversation; startup stops waiting and says so.
+  "claude_resume_selection_prompt",
   // Codex auth refusal (stored OAuth token can no longer be refreshed).
   // Defensive: row 6's verifyResumeLaunch patch propagates attention_required
   // through the launch path so the readiness fallback shouldn't see this code,

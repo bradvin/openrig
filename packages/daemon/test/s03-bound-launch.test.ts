@@ -46,14 +46,12 @@ function fixture() {
   const daemonBin = path.join(root, "daemon-bin"); mkdirSync(daemonBin); writeFileSync(path.join(daemonBin, "claude"), "different daemon executable"); chmodSync(path.join(daemonBin, "claude"), 0o700);
   const db = new Database(":memory:"); open.push(db);
   // Minimal tables, not a migration or a daemon fixture.
-  db.exec(`CREATE TABLE rigs(id TEXT PRIMARY KEY, archived_at TEXT);
-    CREATE TABLE nodes(id TEXT, rig_id TEXT, runtime TEXT, cwd TEXT);
+  db.exec(`CREATE TABLE nodes(id TEXT, runtime TEXT, cwd TEXT);
     CREATE TABLE bindings(id TEXT, node_id TEXT, tmux_session TEXT, tmux_pane TEXT);
     CREATE TABLE occupant_tenures(node_id TEXT, generation_uuid TEXT, generation_ordinal INTEGER);
     CREATE TABLE node_permission_selections(node_id TEXT PRIMARY KEY, runtime TEXT, mode TEXT, actor TEXT, reason TEXT, updated_at TEXT);
     CREATE TABLE events(payload TEXT);`);
-  db.exec("INSERT INTO rigs VALUES ('rig',NULL)");
-  db.prepare("INSERT INTO nodes VALUES ('node','rig','claude-code',?)").run(cwd);
+  db.prepare("INSERT INTO nodes VALUES ('node','claude-code',?)").run(cwd);
   db.exec("INSERT INTO bindings VALUES ('binding','node','seat','%1'); INSERT INTO occupant_tenures VALUES ('node','generation-1',1)");
   const env: Record<string,string> = { PATH: "./bin" + path.delimiter + daemonBin, HOME: path.join(root, "home"), CLAUDE_CONFIG_DIR: "./config",
     ANTHROPIC_API_KEY: "synthetic-secret-never-in-command", OPENRIG_HOME: path.join(root, "instance") };
@@ -78,6 +76,20 @@ function fixture() {
     expect(options.env.ANTHROPIC_API_KEY).toBeUndefined(); done(null, help);
   }) as any);
   return { root, cwd, executable, daemonBin, db, env, renderer, managed, tmux, calls, adapter, binding, service, eventBus };
+}
+// Exercise the actual initial-shell reset without starting a tmux server or native Claude.
+async function scopedPaneLaunch(env: Record<string, string>, command: string, runtimeDir?: string): Promise<string[]> {
+  const tmux = new TmuxAdapter(async () => { throw Error("argv fixture only"); }, undefined, async args => {
+    if (args.at(-1) === "default-shell") return "/bin/sh";
+    if (args.at(-1) === "update-environment") return "WAYLAND_DISPLAY TERM_PROGRAM TERM_PROGRAM_VERSION";
+    throw Error(`Unexpected option query: ${args.at(-1)}`);
+  });
+  tmux.launchEnvironment = () => ({ inheritTmuxEnvironment: false,
+    env: { ...env, TERM_PROGRAM: "daemon-editor", TERM_PROGRAM_VERSION: "daemon-version" }, runtimeDir });
+  const launch = await (tmux as unknown as { scopedLaunchCommand(env: Record<string, string>, command: string): Promise<string[] | null> })
+    .scopedLaunchCommand({ OPENRIG_NODE_ID: "node" }, command);
+  expect(launch).not.toBeNull();
+  return launch!;
 }
 const input = { seatRef: "owner@rig", mode: "auto", actor: "operator", reason: "deliberate choice" };
 
@@ -184,11 +196,11 @@ if (process.argv.includes('--help')) {
     expect(command).not.toContain("UNAPPROVED_RENDERER_VALUE");
     expect(command).not.toMatch(/TMUX/);
   });
-  it.each([
+  for (const scoped of [false, true]) it.each([
     ["present", { TERM_PROGRAM: "tmux", TERM_PROGRAM_VERSION: "3.7c" }],
     ["absent", {}],
     ["empty", { TERM_PROGRAM: "", TERM_PROGRAM_VERSION: "" }],
-  ])("hands Claude the pane's TERM_PROGRAM when it is %s, so Claude asks tmux for extended keys", async (label, programEnv) => {
+  ])(`hands Claude the pane's TERM_PROGRAM when it is %s (scoped=${scoped}), so Claude asks tmux for extended keys`, async (label, programEnv) => {
     const f = fixture();
     // Claude requests extended keys (Shift+Enter) only when it can tell it runs inside tmux.
     writeFileSync(f.executable, `#!${process.execPath}\n
@@ -204,8 +216,9 @@ else console.log(JSON.stringify(Object.fromEntries(['TMUX', 'TERM_PROGRAM', 'TER
     const paneEnv: Record<string, string> = { ...f.env, TMUX: "/tmp/tmux-1000/default,123,0", TMUX_PANE: "%1", ...programEnv };
     // Some shells set these themselves; model the absent case before the command expands them.
     const paneCommand = label === "absent" ? `unset TMUX TERM_PROGRAM TERM_PROGRAM_VERSION; ${command}` : command;
+    const launch = scoped ? await scopedPaneLaunch(f.env, paneCommand) : ["/bin/sh", "-c", paneCommand];
     const stdout = await new Promise<string>((resolve, reject) => {
-      native.execFile("/bin/sh", ["-c", paneCommand], { encoding: "utf8", timeout: 3000, env: paneEnv },
+      native.execFile(launch[0]!, launch.slice(1), { encoding: "utf8", timeout: 3000, env: paneEnv },
         (error, out) => error ? reject(error) : resolve(out));
     });
     // An empty or absent variable stays absent; TMUX and TMUX_PANE never arrive.
@@ -225,7 +238,7 @@ else console.log(JSON.stringify(Object.fromEntries(['TMUX', 'TERM_PROGRAM', 'TER
   // when the host has it (OPENRIG_TEST_DASH names one).
   const dash = [process.env.OPENRIG_TEST_DASH, "/usr/bin/dash", "/bin/dash"].find(file => file && existsSync(file));
   const shells = ["/bin/sh", ...(dash ? [dash] : [])];
-  async function runPane(f: ReturnType<typeof fixture>, pane: Record<string, string>, unset: string[] = [], shell = "/bin/sh"): Promise<Record<string, string>> {
+  async function runPane(f: ReturnType<typeof fixture>, pane: Record<string, string>, unset: string[] = [], shell = "/bin/sh", scopedRuntimeDir?: string): Promise<Record<string, string>> {
     writeFileSync(f.executable, `#!${process.execPath}\n
 if (process.argv.includes('--help')) console.log(${JSON.stringify(help)});
 else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
@@ -237,8 +250,9 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
     const command = prepared.command(["--permission-mode", "auto"]);
     // Some shells set these themselves; model the absent case before the command expands them.
     const paneCommand = unset.length ? `unset ${unset.join(" ")}; ${command}` : command;
+    const launch = scopedRuntimeDir ? await scopedPaneLaunch(f.env, paneCommand, scopedRuntimeDir) : [shell, "-c", paneCommand];
     const stdout = await new Promise<string>((resolve, reject) => {
-      native.execFile(shell, ["-c", paneCommand], { encoding: "utf8", timeout: 3000, env: { ...f.env, ...pane } },
+      native.execFile(launch[0]!, launch.slice(1), { encoding: "utf8", timeout: 3000, env: { ...f.env, ...pane } },
         (error, out) => error ? reject(error) : resolve(out));
     });
     return JSON.parse(stdout);
@@ -274,6 +288,13 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
     const f = fixture();
     const unset = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"].filter(key => !(key in pane));
     expect(await runPane(f, { ...withheldInPane, ...pane }, unset, shell)).toEqual(expected === undefined ? {} : { WAYLAND_DISPLAY: expected });
+  });
+  it("resolves a relative Wayland display through the scoped reset and managed launch", async () => {
+    vi.stubEnv("WAYLAND_DISPLAY", "wayland-1");
+    const f = fixture();
+    expect(await runPane(f, {}, [], "/bin/sh", "/run/test user")).toEqual({
+      WAYLAND_DISPLAY: "/run/test user/wayland-1", XDG_RUNTIME_DIR: "/run/test user", DBUS_SESSION_BUS_ADDRESS: "disabled:",
+    });
   });
   it("uses balanced case patterns and no unquoted substitution for WAYLAND_DISPLAY", async () => {
     const f = fixture();

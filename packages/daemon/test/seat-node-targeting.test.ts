@@ -127,8 +127,8 @@ describe("node-addressed seat settings", () => {
     expect(db.prepare("SELECT COUNT(*) n FROM events WHERE type=?").get(event)).toEqual(count);
   });
 
-  it.each(["delete", "archive", "runtime", "cwd", "new-session"] as const)(
-    "rechecks node eligibility after awaited stub validation: %s", async change => {
+  it.each(["delete", "archive"] as const)(
+    "refuses an unavailable exact node after awaited Claude preparation: %s", async change => {
       const rig = app.rigRepo.createRig("claude-rig");
       const node = app.rigRepo.addNode(rig.id, "worker", { runtime: "claude-code", cwd: "/old" });
       let enter!: () => void, release!: () => void;
@@ -145,20 +145,38 @@ describe("node-addressed seat settings", () => {
       const saving = service.setPermissions({ nodeId: node.id, mode: "acceptEdits", reason: "native choice", actor: "operator@control" });
       await entered;
       if (change === "delete") app.rigRepo.deleteNode(node.id);
-      if (change === "archive") app.rigRepo.archiveRig(rig.id);
-      if (change === "runtime") db.prepare("UPDATE nodes SET runtime='codex' WHERE id=?").run(node.id);
-      if (change === "cwd") db.prepare("UPDATE nodes SET cwd='/new' WHERE id=?").run(node.id);
-      if (change === "new-session") app.sessionRegistry.registerSession(node.id, "worker@claude-rig");
+      else app.rigRepo.archiveRig(rig.id);
       release();
       const result = await saving;
-      if (change === "new-session") {
-        expect(result).toMatchObject({ ok: true, changed: true, seat: { nodeId: node.id } });
-      } else {
-        expect(result).toMatchObject({ ok: false, code: change === "delete" || change === "archive" ? "seat_not_found" : "selection_changed" });
-      }
+      expect(result).toMatchObject({ ok: false, code: "seat_not_found" });
       expect(db.prepare("SELECT COUNT(*) n FROM events WHERE type='node.permissions_changed'").get())
-        .toEqual({ n: change === "new-session" ? 1 : 0 });
+        .toEqual({ n: 0 });
       expect(db.prepare("SELECT COUNT(*) n FROM node_permission_selections WHERE node_id=?").get(node.id))
-        .toEqual({ n: change === "new-session" ? 1 : 0 });
+        .toEqual({ n: 0 });
+    });
+
+  it.each(["delete", "archive"] as const)(
+    "refuses an unavailable exact node after awaited Codex profile observation: %s", async change => {
+      const selected = add("one");
+      db.prepare("UPDATE nodes SET cwd='/old' WHERE id=?").run(selected.node.id);
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      const service = new SeatLifecycleService({ db, rigRepo: app.rigRepo, sessionRegistry: app.sessionRegistry,
+        eventBus: app.eventBus, tmuxAdapter: app.tmuxAdapter,
+        runtimeAdapters: { codex: { observeProfile: async () => {
+          enter(); await pending;
+          return { vantage: "configured_codex_home", home: "/home/codex", file: "absent", load: "ok",
+            detail: "Profile file absent", observedAt: new Date().toISOString() };
+        } } as never } });
+      const saving = service.setPermissions({ nodeId: selected.node.id, codexProfile: "reviewed", reason: "native choice", actor: "operator@control" });
+      await entered;
+      if (change === "delete") app.rigRepo.deleteNode(selected.node.id);
+      else app.rigRepo.archiveRig(selected.rig.id);
+      release();
+      expect(await saving).toMatchObject({ ok: false, code: "seat_not_found" });
+      expect(db.prepare("SELECT COUNT(*) n FROM events WHERE type='node.codex_profile_changed'").get()).toEqual({ n: 0 });
+      expect(db.prepare("SELECT COUNT(*) n FROM nodes WHERE id=? AND codex_config_profile IS NOT NULL").get(selected.node.id))
+        .toEqual({ n: 0 });
     });
 });

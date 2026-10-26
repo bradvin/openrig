@@ -190,13 +190,66 @@ describe("selected-history startup", () => {
     expect(kill).not.toHaveBeenCalled();
   });
 
-  it("refuses conflicting persisted Codex mode and envelope at review", async () => {
+  it("reports a conflicting persisted Codex mode and envelope as an unavailable permission choice", async () => {
     const f = fixture();
     db.prepare("UPDATE nodes SET codex_permissions_json=? WHERE id=?")
       .run(JSON.stringify({ sandbox: "read-only", approval: "never" }), f.node.id);
     db.prepare("INSERT INTO node_permission_selections (node_id, runtime, mode, actor, reason) VALUES (?, 'codex', 'floor', 'test', 'conflict')")
       .run(f.node.id);
-    expect((await review(f)).response.status).toBe(409);
+    const launch = vi.spyOn(setup.restoreOrchestrator, "launchSingleNode");
+    const create = vi.spyOn(setup.tmuxAdapter, "createSession");
+    const result = await review(f);
+    expect(result.response.status).toBe(409);
+    expect(result.body).toMatchObject({ ok: false, code: "permission_unavailable",
+      message: "The selected seat's saved permission choice needs repair before launch." });
+    expect(JSON.stringify(result.body)).not.toContain(tokenA);
+    expect(JSON.stringify(result.body)).not.toContain(tokenB);
+    expect(launch).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("reports permission failure found by the review post-observation recheck", async () => {
+    const f = fixture();
+    const launch = vi.spyOn(setup.restoreOrchestrator, "launchSingleNode");
+    const create = vi.spyOn(setup.tmuxAdapter, "createSession");
+    setup.tmuxAdapter.probeSession = vi.fn(async () => {
+      db.prepare("UPDATE nodes SET codex_permissions_json=? WHERE id=?")
+        .run(JSON.stringify({ sandbox: "read-only", approval: "never" }), f.node.id);
+      db.prepare("INSERT INTO node_permission_selections (node_id, runtime, mode, actor, reason) VALUES (?, 'codex', 'floor', 'test', 'conflict')")
+        .run(f.node.id);
+      return { state: "absent" as const };
+    });
+    const result = await review(f);
+    expect(result.response.status).toBe(409);
+    expect(result.body).toMatchObject({ ok: false, code: "permission_unavailable",
+      message: "The selected seat's saved permission choice needs repair before launch." });
+    expect(JSON.stringify(result.body)).not.toContain(tokenA);
+    expect(JSON.stringify(result.body)).not.toContain(tokenB);
+    expect(launch).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("reports a permission conflict before apply can launch a reviewed history", async () => {
+    const f = fixture();
+    const accepted = await review(f);
+    expect(accepted.response.status).toBe(200);
+    db.prepare("UPDATE nodes SET codex_permissions_json=? WHERE id=?")
+      .run(JSON.stringify({ sandbox: "read-only", approval: "never" }), f.node.id);
+    db.prepare("INSERT INTO node_permission_selections (node_id, runtime, mode, actor, reason) VALUES (?, 'codex', 'floor', 'test', 'conflict')")
+      .run(f.node.id);
+    const launch = vi.spyOn(setup.restoreOrchestrator, "launchSingleNode");
+    const create = vi.spyOn(setup.tmuxAdapter, "createSession");
+    const native = vi.spyOn(CodexResumeAdapter.prototype, "resume");
+    const response = await request(f.path, { action: "resume", ...f.refs, revision: accepted.body.revision });
+    const result = await response.json() as Record<string, unknown>;
+    expect(response.status).toBe(409);
+    expect(result).toMatchObject({ ok: false, code: "permission_unavailable",
+      message: "The selected seat's saved permission choice needs repair before launch." });
+    expect(JSON.stringify(result)).not.toContain(tokenA);
+    expect(JSON.stringify(result)).not.toContain(tokenB);
+    expect(launch).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(native).not.toHaveBeenCalled();
   });
 
   it("keeps typed IDs and outcome intact when a short Claude name appears in diagnostics", async () => {

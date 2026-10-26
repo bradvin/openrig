@@ -75,6 +75,7 @@ function sharedHistoryDeps(c: Context) {
 }
 
 type HistoryRefs = { snapshotId: string; historySessionId: string };
+type SelectedState = { review: string; native: string } | { permissionUnavailable: true };
 
 /** The captured locator must still name the registry's same native history.
  * Status and verification freshness can change without changing that identity. */
@@ -118,7 +119,7 @@ function selectedFacts(c: Context, rigId: string, nodeId: string, refs: HistoryR
 
 /** Exact review inputs. Native checks omit expected changes to status/binding
  * made by this very launch, while still fencing source identity and settings. */
-function selectedState(c: Context, rigId: string, nodeId: string, refs: HistoryRefs, snapshot: Snapshot) {
+function selectedState(c: Context, rigId: string, nodeId: string, refs: HistoryRefs, snapshot: Snapshot): SelectedState | null {
   const db = repo(c).db;
   const one = (sql: string, ...args: string[]) => db.prepare(sql).get(...args);
   const rig = one("SELECT * FROM rigs WHERE id = ?", rigId);
@@ -142,7 +143,7 @@ function selectedState(c: Context, rigId: string, nodeId: string, refs: HistoryR
   const permissions = one("SELECT * FROM node_permission_selections WHERE node_id = ?", nodeId);
   let permissionPlan: ReturnType<typeof selectedPermissionFacts>;
   try { permissionPlan = selectedPermissionFacts(c, rigId, nodeId, savedNode.runtime ?? ""); }
-  catch { return null; }
+  catch { return { permissionUnavailable: true }; }
   const stable = { rig, node, savedSelection, stableSource, context, permissions, permissionPlan };
   const native = createHash("sha256").update(JSON.stringify(stable)).digest("hex");
   const histories = db.prepare("SELECT id, status, resume_type, resume_token, restore_policy FROM sessions WHERE node_id = ? ORDER BY id").all(nodeId);
@@ -295,12 +296,16 @@ startupRoutes.get("/:rigId/nodes/:nodeId", async (c) => {
   if (!selection.ok) return c.json(selection, selection.code === "seat_unavailable" ? 404 : 409);
   const facts = selectedFacts(c, rigId, nodeId, refs);
   const state = facts && selectedState(c, rigId, nodeId, refs, facts.snapshot);
+  if (state && "permissionUnavailable" in state) return c.json({ ok: false, code: "permission_unavailable",
+    message: "The selected seat's saved permission choice needs repair before launch." }, 409);
   if (!facts || !state) return c.json({ ok: false, code: "selection_changed", message: "The selected source changed. Refresh the history list." }, 409);
   const forecast = buildRestorePlanPreview({ ...facts.rig, nodes: [facts.node] }, facts.snapshot,
     collectPreviewSessionRows(repo(c).db, { ...facts.rig, nodes: [facts.node] }, facts.snapshot), undefined, Date.now(), {},
     { nodeId, historySessionId: refs.historySessionId }).nodes[0]!;
   const observed = await observeSeat(c, facts.rig, facts.node);
   const checked = selectedState(c, rigId, nodeId, refs, facts.snapshot);
+  if (checked && "permissionUnavailable" in checked) return c.json({ ok: false, code: "permission_unavailable",
+    message: "The selected seat's saved permission choice needs repair before launch." }, 409);
   if (!checked || checked.review !== state.review) return c.json({ ok: false, code: "selection_changed", message: "The selected source changed during review. Refresh." }, 409);
   const capturedNode = facts.snapshot.data.nodes.find(node => node.id === nodeId);
   let permission: ReturnType<typeof selectedPermissionFacts>;
@@ -328,6 +333,8 @@ startupRoutes.post("/:rigId/nodes/:nodeId", async (c) => {
     if (!selection.ok) return c.json(selection, selection.code === "seat_unavailable" ? 404 : 409);
     const facts = selectedFacts(c, rigId, nodeId, refs);
     const state = facts && selectedState(c, rigId, nodeId, refs, facts.snapshot);
+    if (state && "permissionUnavailable" in state) return c.json({ ok: false, code: "permission_unavailable",
+      message: "The selected seat's saved permission choice needs repair before launch." }, 409);
     if (!facts || !state || refs.revision !== state.review) return c.json({ ok: false, code: "selection_changed", message: "The selected seat or history changed. Refresh the review." }, 409);
     const observed = await observeSeat(c, facts.rig, facts.node);
     if (observed.state !== "stopped") return c.json({ ok: false, code: observed.state, message: "The selected seat is running or its terminal state is uncertain. No resume was started." }, 409);
@@ -337,7 +344,7 @@ startupRoutes.post("/:rigId/nodes/:nodeId", async (c) => {
       const again = listSharedHistories(sharedHistoryDeps(c), rigId, nodeId, refs);
       const current = selectedFacts(c, rigId, nodeId, refs);
       const revision = current && selectedState(c, rigId, nodeId, refs, current.snapshot);
-      return again.ok && !!revision && revision.review === state.review;
+      return again.ok && !!revision && "review" in revision && revision.review === state.review;
     };
     if (!beforeEffect()) return c.json({ ok: false, code: "selection_changed", message: "The selected seat or history changed during prerequisites. No resume was started." }, 409);
     let launchedBindingId: string | undefined;
@@ -346,7 +353,7 @@ startupRoutes.post("/:rigId/nodes/:nodeId", async (c) => {
       if (!rig?.nodes.some(node => node.id === nodeId && node.logicalId === facts.node.logicalId)) return false;
       if (dep<SnapshotRepository>(c, "snapshotRepo").findLatestRestoreUsable(rigId)?.id !== refs.snapshotId) return false;
       const current = selectedState(c, rigId, nodeId, refs, facts.snapshot);
-      if (!current || current.native !== state.native) return false;
+      if (!current || !("native" in current) || current.native !== state.native) return false;
       if (!resultSessionId) return true;
       const result = repo(c).db.prepare("SELECT node_id, session_name, status FROM sessions WHERE id = ?").get(resultSessionId) as
         { node_id: string; session_name: string; status: string } | undefined;

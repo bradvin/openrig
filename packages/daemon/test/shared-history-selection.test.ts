@@ -264,6 +264,51 @@ describe("authenticated shared history selection", () => {
     if (field === "resumeToken") expect(setup.restoreOrchestrator.canAttemptRecordedResume("codex", "codex_id", 123 as never)).toBe(false);
   });
 
+  it.each([null, [], "invalid-map", 7])("refuses malformed legacy occupant map %j before current-source compatibility", async (legacy) => {
+    const f = fixture();
+    const changed = structuredClone(f.snapshot.data);
+    delete changed.activeOccupantsByNode;
+    changed.activeSessionIdByNode = legacy as never;
+    db.prepare("UPDATE snapshots SET data=? WHERE id=?").run(JSON.stringify(changed), f.snapshot.id);
+    const writesBefore = (db.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+    const capture = vi.spyOn(setup.snapshotCapture, "captureSnapshot");
+    const restore = vi.spyOn(setup.restoreOrchestrator, "restore");
+    const launch = vi.spyOn(setup.restoreOrchestrator, "launchSingleNode");
+    setup.tmuxAdapter.probeSession = vi.fn(async () => ({ state: "absent" as const }));
+    const paneProbe = vi.mocked(setup.tmuxAdapter.probeSession);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const listed = await request(f.path);
+    const validated = await request(`${f.path}/validate`, { snapshotId: f.snapshot.id, historySessionId: f.old.id });
+    expect(listed.status).toBe(409);
+    expect(validated.status).toBe(409);
+    for (const response of [listed, validated]) {
+      const raw = await response.text();
+      expect(JSON.parse(raw)).toMatchObject({ ok: false, code: "source_unavailable" });
+      expect(raw).not.toContain(secret);
+      expect(raw).not.toContain("invalid-map");
+    }
+    expect(logged).not.toHaveBeenCalled(); expect(warned).not.toHaveBeenCalled();
+    expect((db.prepare("SELECT total_changes() AS n").get() as { n: number }).n).toBe(writesBefore);
+    expect(capture).not.toHaveBeenCalled(); expect(restore).not.toHaveBeenCalled(); expect(launch).not.toHaveBeenCalled();
+    expect(paneProbe).not.toHaveBeenCalled();
+  });
+
+  it("keeps omitted legacy occupancy maps usable with the unique running row", async () => {
+    const f = fixture();
+    const legacy = structuredClone(f.snapshot.data);
+    delete legacy.activeOccupantsByNode;
+    delete legacy.activeSessionIdByNode;
+    db.prepare("UPDATE snapshots SET data=? WHERE id=?").run(JSON.stringify(legacy), f.snapshot.id);
+    const listed = await request(f.path);
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toMatchObject({ ok: true,
+      histories: [{ historySessionId: f.old.id }, { historySessionId: f.current.id }] });
+    const validated = await request(`${f.path}/validate`, { snapshotId: f.snapshot.id, historySessionId: f.old.id });
+    expect(validated.status).toBe(200);
+    expect(await validated.json()).toMatchObject({ ok: true, eligibleForAttempt: true });
+  });
+
   it("refuses a changed or ambiguous current source and a same-name replacement", async () => {
     const f = fixture();
     db.prepare("UPDATE sessions SET resume_token='changed' WHERE id=?").run(f.current.id);

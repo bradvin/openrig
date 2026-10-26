@@ -321,6 +321,40 @@ describe("selected-history startup", () => {
     expect(JSON.stringify(result)).not.toContain(tokenB);
   });
 
+  it("reports a resumed launch as unconfirmed when final ownership detects selection drift", async () => {
+    setup = createTestApp(db, { listProcesses: async () => [
+      { pid: 1234, ppid: 1, command: "zsh" },
+      { pid: 1235, ppid: 1234, command: `claude --resume ${tokenA}` },
+    ], appDeps: { terminalBearerToken: "terminal-test-token" } });
+    setup.tmuxAdapter.probeSession = vi.fn(async () => ({ state: "absent" as const }));
+    setup.tmuxAdapter.listPanes = vi.fn(async () => [{ id: "%1", index: 0, cwd: "/", width: 80, height: 24, active: true }]);
+    setup.tmuxAdapter.getPanePid = vi.fn(async () => 1234);
+    setup.tmuxAdapter.getPaneCommand = vi.fn(async () => "claude");
+    const f = fixture(false, "claude-code"); const { body } = await review(f);
+    const originalLaunch = setup.restoreOrchestrator.launchSingleNode.bind(setup.restoreOrchestrator);
+    let actualOutcomeStatus: string | undefined;
+    const launch = vi.spyOn(setup.restoreOrchestrator, "launchSingleNode").mockImplementation(async (rigId, logicalId, opts) => {
+      const result = await originalLaunch(rigId, logicalId, opts);
+      actualOutcomeStatus = result.launched?.[0]?.status;
+      db.prepare("UPDATE nodes SET model='changed-after-resume' WHERE id=?").run(f.node.id);
+      return result;
+    });
+    const native = vi.spyOn(ClaudeResumeAdapter.prototype, "resume").mockResolvedValue({ ok: true });
+    const kill = vi.spyOn(setup.tmuxAdapter, "killSession");
+    const response = await request(f.path, { action: "resume", ...f.refs, revision: body.revision });
+    const result = await response.json() as Record<string, unknown>;
+    expect(response.status).toBe(409);
+    expect(result).toMatchObject({ ok: false, sourceSessionId: f.old.id, resultSessionId: expect.any(String), code: "resume_unconfirmed" });
+    expect(result.resultSessionId).not.toBe(f.old.id);
+    expect(actualOutcomeStatus).toBe("resumed");
+    expect(JSON.stringify(result)).not.toContain(tokenA);
+    expect(JSON.stringify(result)).not.toContain(tokenB);
+    expect(launch).toHaveBeenCalledOnce();
+    expect(native).toHaveBeenCalledOnce();
+    expect(native.mock.calls[0]![2]).toBe(tokenA);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it("does not call a reported native launch success joined without pane continuity proof", async () => {
     const f = fixture(); const { body } = await review(f);
     vi.spyOn(CodexResumeAdapter.prototype, "resume").mockResolvedValue({ ok: true });
@@ -345,7 +379,7 @@ describe("selected-history startup", () => {
     const response = await request(f.path, { action: "resume", ...f.refs, revision: body.revision });
     const result = await response.json() as Record<string, unknown>;
     expect(response.status).toBe(200);
-    expect(result).toMatchObject({ ok: true, sourceSessionId: f.old.id, resultSessionId: expect.any(String) });
+    expect(result).toMatchObject({ ok: true, sourceSessionId: f.old.id, resultSessionId: expect.any(String), code: "resumed" });
     expect(JSON.stringify(result)).not.toContain(tokenA);
   });
 

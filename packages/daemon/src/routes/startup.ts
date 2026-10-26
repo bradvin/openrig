@@ -385,7 +385,7 @@ startupRoutes.post("/:rigId/nodes/:nodeId", async (c) => {
     }
     const diagnosticTokens = [...tokens];
     const response = { ok, rigId, nodeId, snapshotId: refs.snapshotId, historySessionId: refs.historySessionId,
-      code: !ok && outcome?.status === "resumed" ? "selection_changed" : outcome?.status ?? result.code ?? "resume_unconfirmed",
+      code: !ok && outcome?.status === "resumed" ? "resume_unconfirmed" : outcome?.status ?? result.code ?? "resume_unconfirmed",
       sourceSessionId: refs.historySessionId, resultSessionId: outcome?.resultSessionId ?? null,
       message: redactDiagnostic(outcome?.error ?? result.message ?? (ok ? "Selected native history resumed and joined." : "Selected resume was not confirmed; inspect this seat before retrying."), diagnosticTokens),
       warnings: result.warnings?.map(warning => redactDiagnostic(warning, diagnosticTokens)),

@@ -3,6 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { defaultListProcesses } from "../src/adapters/codex-runtime-adapter.js";
+import { readNativeProcessArguments } from "../src/domain/native-process-arguments.js";
+// The fixture's synthetic PIDs must never inspect host processes.
+vi.mock("../src/domain/native-process-arguments.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../src/domain/native-process-arguments.js")>(),
+  readNativeProcessArguments: vi.fn(async () => new Map()),
+}));
 import { restoreProc, serveProcRoot, writeFakeProc } from "./helpers/fake-proc.js";
 
 let scratch: string | undefined;
@@ -41,7 +47,7 @@ it("reads foreground identity through the real async executable and parser path"
   expect(rows).toEqual([
     { pid: 101, ppid: 1, pgid: 101, tpgid: 102, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000", command: "-zsh" },
     { pid: 102, ppid: 101, pgid: 102, tpgid: 102, executableName: "node", startedAt: "Sat Jan  1 12:00:00 2000", command: "node /opt/bin/codex -C /project" },
-    { pid: 103, ppid: 102, pgid: 102, tpgid: 102, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "/opt/vendor/bin/codex -C /project" },
+    { pid: 103, ppid: 102, pgid: 102, tpgid: 102, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "/opt/vendor/bin/codex -C /project", argv: null },
     { pid: 104, ppid: 1, pgid: 104, tpgid: -1, executableName: "node", startedAt: "Sat Jan  1 12:00:00 2000", command: "node /tmp/other.js --label codex" },
     { pid: 106, ppid: 1, pgid: 106, tpgid: -1, executableName: "tmux: server", startedAt: "Sat Jan  1 12:00:00 2000", command: "tmux new-session -d" },
     { pid: 107, ppid: 1, pgid: 107, tpgid: -1, executableName: "node (vitest 1)", startedAt: "Sat Jan  1 12:00:00 2000", command: "node (vitest 1)" },
@@ -55,7 +61,8 @@ it("reads foreground identity through the real /proc reader and parser path", as
   const listed = [
     { pid: 101, ppid: 1, pgid: 101, tpgid: 102, name: "zsh", startedAt: started, command: "-zsh" },
     { pid: 102, ppid: 101, pgid: 102, tpgid: 102, name: "node", startedAt: started, command: "node /opt/bin/codex -C /project" },
-    { pid: 103, ppid: 102, pgid: 102, tpgid: 102, name: "codex", startedAt: started, command: "/opt/vendor/bin/codex -C /project" },
+    { pid: 103, ppid: 102, pgid: 102, tpgid: 102, name: "codex", startedAt: started, command: "/opt/vendor/bin/codex -C /project",
+      argv: ["/opt/vendor/bin/codex", "-C", "/project"] },
     { pid: 104, ppid: 1, pgid: 104, tpgid: -1, name: "node", startedAt: started, command: "node /tmp/other.js --label codex" },
     // Linux task names may contain spaces (prctl PR_SET_NAME / process.title).
     { pid: 106, ppid: 1, pgid: 106, tpgid: -1, name: "tmux: server", startedAt: started, command: "tmux new-session -d" },
@@ -71,8 +78,10 @@ it("reads foreground identity through the real /proc reader and parser path", as
   scratch = fs.mkdtempSync(path.join(os.tmpdir(), "codex-process-read-"));
   fs.writeFileSync(path.join(scratch, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
   vi.stubEnv("PATH", scratch);
+  vi.mocked(readNativeProcessArguments).mockClear();
   const rows = await defaultListProcesses();
   expect(rows.sort((a, b) => a.pid - b.pid)).toEqual(listed.map(({ name, ...row }) => ({ ...row, executableName: name })));
+  expect(readNativeProcessArguments).not.toHaveBeenCalled();
   serveProcRoot(path.join(root, "gone"));
   expect(await defaultListProcesses()).toEqual([]);
 });

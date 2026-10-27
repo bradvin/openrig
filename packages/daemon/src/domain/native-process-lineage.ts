@@ -1,12 +1,15 @@
 import { isShellForeground } from "./shell-classifier.js";
 import { runAsyncSite } from "./sync-site-wrap.js";
 import { readNativeExecutablePaths } from "./native-process-executable.js";
+import { readNativeProcessArguments } from "./native-process-arguments.js";
 import { readProcessTable } from "./process-table.js";
 
 export interface NativeProcessRow {
   pid: number;
   ppid: number;
   command: string;
+  /** Exact OS argv for native Codex. Missing, malformed, or unreadable argv never proves Codex identity. */
+  argv?: string[] | null;
   pgid?: number;
   tpgid?: number;
   executableName?: string;
@@ -128,21 +131,18 @@ function mayBeClaudeAfterScript(row: NativeProcessRow): boolean {
 }
 
 function commandUsesExpectedToken(command: string, runtime: NativeRuntime, expectedToken: string): boolean {
+  // Codex takes the exact-argv selector in findExactNativeResumeProcess before this Claude-only search.
+  if (runtime !== "claude-code") return false;
   const argv = tokens(command);
-  const executable = runtime === "claude-code" ? "claude" : "codex";
-  const executableIndex = argv.findIndex((token) => runtime === "claude-code" ? claudeExecutable(token) : executableName(token) === executable);
+  const executableIndex = argv.findIndex((token) => claudeExecutable(token));
   if (executableIndex < 0) return false;
   const args = argv.slice(executableIndex + 1);
-  if (runtime === "claude-code") {
-    for (let index = 0; index < args.length; index += 1) {
-      const arg = args[index]!;
-      if ((arg === "--resume" || arg === "--session-id") && args[index + 1] === expectedToken) return true;
-      if (arg === `--resume=${expectedToken}` || arg === `--session-id=${expectedToken}`) return true;
-    }
-    return false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if ((arg === "--resume" || arg === "--session-id") && args[index + 1] === expectedToken) return true;
+    if (arg === `--resume=${expectedToken}` || arg === `--session-id=${expectedToken}`) return true;
   }
-
-  return codexConversationToken(args, "resume") === expectedToken;
+  return false;
 }
 
 // Interactive options can appear before or after `resume`/`fork`. Their values
@@ -167,7 +167,7 @@ function codexOptionEnd(args: string[], index: number): number {
 }
 
 // undefined is another command; null is the requested command without an exact token.
-function codexConversationToken(args: string[], subcommand: "resume" | "fork"): string | null | undefined {
+function codexConversationToken(args: string[], subcommand: "resume" | "fork", exactArgv = false): string | null | undefined {
   let resumeIndex = -1;
   for (let index = 0; index < args.length;) {
     const arg = args[index]!;
@@ -186,10 +186,10 @@ function codexConversationToken(args: string[], subcommand: "resume" | "fork"): 
     if (arg === "--") { conversation ??= resumeArgs[index + 1] ?? null; break; }
     if (arg === "--last") last = true;
     if (arg.startsWith("-")) { index = codexOptionEnd(resumeArgs, index); continue; }
-    // ps has lost argv boundaries: after a session and the first prompt word,
-    // later option-looking words belong to the prompt. A real --last conflicts
-    // with a session plus a prompt in Codex's interactive grammar.
-    if (conversation !== null) break;
+    // A flattened ps command cannot tell a quoted prompt from several argv entries. Exact
+    // argv can: keep scanning for a real --last after a prompt, while a literal --last
+    // inside one prompt argument never equals the option.
+    if (conversation !== null) { if (!exactArgv) break; index += 1; continue; }
     conversation = arg;
     index += 1;
   }
@@ -213,6 +213,19 @@ export function claudeCommandSessionToken(command: string): string | null {
  *  when the command is not a resume at all (a fresh `codex -C …`). */
 export function codexCommandResumeToken(command: string): string | null | undefined {
   return codexConversationToken(tokens(command).slice(1), "resume");
+}
+
+/** The native process's own resume identity. Flattened ps text is never positive proof. */
+export function codexProcessResumeToken(row: Pick<NativeProcessRow, "argv">): string | null | undefined {
+  return validCodexArgv(row) ? codexConversationToken(row.argv!.slice(1), "resume", true) : undefined;
+}
+
+function validCodexArgv(row: Pick<NativeProcessRow, "argv">): row is { argv: string[] } {
+  let bytes = 0;
+  return Array.isArray(row.argv) && row.argv.length > 0 && row.argv.length <= 4096
+    && typeof row.argv[0] === "string" && row.argv[0].length > 0
+    && row.argv.every(arg => typeof arg === "string" && !arg.includes("\0")
+      && (bytes += Buffer.byteLength(arg)) <= 1024 * 1024);
 }
 
 type ClaudeArgvIds = { resume: string | null; "session-id": string | null };
@@ -496,6 +509,13 @@ export async function listNativeProcesses(options: { claudeLaunchPaths?: boolean
       const paths = await readNativeExecutablePaths(candidates.map(row => row.pid));
       for (const row of candidates) row.executablePath = paths.get(row.pid);
     }
+    // Linux argv was captured with this same /proc table sample; never read real /proc
+    // again after a caller has selected a fixture or alternate process-table root.
+    const codexCandidates = process.platform === "darwin" ? rows.filter(row => row.executableName === "codex") : [];
+    if (codexCandidates.length > 0) {
+      const argumentsByPid = await readNativeProcessArguments(codexCandidates.map(row => row.pid));
+      for (const row of codexCandidates) row.argv = argumentsByPid.get(row.pid) ?? null;
+    }
     return rows;
   } catch { return []; }
 }
@@ -533,7 +553,7 @@ function candidatesMatching(rows: NativeProcessRow[], panePid: number, runtime: 
   for (const row of rows) {
     const osExecutable = runtime === "claude-code" ? executableName(row.executableName ?? "") : row.executableName;
     if ((runtime === "claude-code" ? !claudeRow(row)
-      : osExecutable !== executable || executableName(tokens(row.command)[0] ?? "") !== executable)
+      : osExecutable !== executable || !validCodexArgv(row) || executableName(row.argv[0] ?? "") !== executable)
       || row.pgid !== root.tpgid || row.tpgid !== root.tpgid) continue;
     const chain: NativeProcessRow[] = [];
     const visited = new Set<number>();
@@ -546,7 +566,9 @@ function candidatesMatching(rows: NativeProcessRow[], panePid: number, runtime: 
     }
   }
   return matches.map(({ process, chain }) => ({ panePid, process,
-    fingerprint: JSON.stringify(chain.map(row => [row.pid, row.ppid, row.startedAt, row.pgid, row.tpgid, row.executableName, row.command, row.executablePath])) }));
+    fingerprint: JSON.stringify(chain.map(row => runtime === "codex"
+      ? [row.pid, row.ppid, row.startedAt, row.pgid, row.tpgid, row.executableName, row.command, row.executablePath, row.argv]
+      : [row.pid, row.ppid, row.startedAt, row.pgid, row.tpgid, row.executableName, row.command, row.executablePath])) }));
 }
 
 function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expectedToken?: string | null, requireResume = false, runtime: NativeRuntime = "codex", selectedExecutable?: string, rotation?: ClaudeResumeRotation | null, scriptLaunch?: boolean): NativeProcessObservation | null {
@@ -565,7 +587,7 @@ function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expected
     // links naming different conversations stay refused. Exact resume proof
     // needs the deepest process's own argv: a launcher's token is never
     // inherited by a child that names nothing, which stays deliverable but unproved.
-    const identities = chain.map((link) => codexConversationToken(tokens(link.process.command).slice(1), "resume"));
+    const identities = chain.map((link) => codexProcessResumeToken(link.process));
     if (new Set(identities.filter((value) => typeof value === "string")).size > 1) return null;
     if (requireResume && (!expectedToken || identities[0] !== expectedToken)) return null;
     if (expectedToken !== undefined && identities.some((value) => value !== undefined
@@ -620,7 +642,7 @@ export function explainNativeRejection(rows: NativeProcessRow[], panePid: number
     if (launched === rotation?.token) return rotationProcess(process, rotation) ? { kind: "passes" } : { kind: "rotation_process_mismatch", conversation: launched };
     return { kind: "other_conversation", conversation: launched };
   }
-  const identities = chain.map((link) => codexConversationToken(tokens(link.process.command).slice(1), "resume"));
+  const identities = chain.map((link) => codexProcessResumeToken(link.process));
   if (new Set(identities.filter((value) => typeof value === "string")).size > 1) return { kind: "conflicting_conversations" };
   if (requireResume) {
     if (!expectedToken) return { kind: "no_recorded_conversation" };
@@ -678,11 +700,11 @@ export async function observeCodexForkProcess(input: {
     const rows = await (input.listProcesses ?? listNativeProcesses)();
     const chain = launcherChain(nativeProcessCandidates(rows, pid, "codex"), rows);
     if (!chain?.length) return null;
-    const args = chain.map(link => tokens(link.process.command).slice(1));
-    const parents = args.map(argv => codexConversationToken(argv, "fork"));
+    const args = chain.map(link => link.process.argv!.slice(1));
+    const parents = args.map(argv => codexConversationToken(argv, "fork", true));
     if (!parents.includes(input.parentToken)
       || parents.some(parent => parent !== undefined && parent !== input.parentToken)
-      || args.some(argv => codexConversationToken(argv, "resume") !== undefined)) return null;
+      || args.some(argv => codexConversationToken(argv, "resume", true) !== undefined)) return null;
     return chain[0]!;
   } catch { return null; }
 }

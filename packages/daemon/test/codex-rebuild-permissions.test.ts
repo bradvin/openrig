@@ -41,7 +41,7 @@ it.each([
 });
 
 describe("the live predecessor record", () => {
-  function fixture(options: { wrongThread?: boolean; stale?: boolean; incompleteLatest?: boolean; turnover?: boolean } = {}) {
+  function fixture(options: { wrongThread?: boolean; stale?: boolean; incompleteLatest?: boolean; turnover?: boolean; argv?: string[] } = {}) {
     const root = mkdtempSync(join(tmpdir(), "codex-rebuild-")); roots.push(root);
     const path = join(root, "record.jsonl");
     writeFileSync(path, [
@@ -52,7 +52,8 @@ describe("the live predecessor record", () => {
     const native = provenCodexResume("fixture-thread");
     let reads = 0;
     const listProcesses = vi.fn(() => {
-      const rows = native.listProcesses();
+      const rows = native.listProcesses().map(row => row.executableName === "codex" && options.argv
+        ? { ...row, command: options.argv.join(" "), argv: options.argv } : row);
       if (options.turnover && reads++ > 0) return rows.map(row => ({ ...row, startedAt: "Tue Oct 20 05:02:01 2026" }));
       return rows;
     });
@@ -67,6 +68,14 @@ describe("the live predecessor record", () => {
     const result = await observeCodexRebuildPermissions(fixture());
     expect(result).toMatchObject({ state: "observed", observedAt: "2026-10-20T05:01:00.000Z",
       envelope: { approvalPolicy: "on-request", sandboxPolicy: payload.sandbox_policy } });
+  });
+  it("reports a managed profile containing spaces from the selected process's exact argv", async () => {
+    const argv = ["codex", "-p", "openrig desktop work", "resume", "fixture-thread"];
+    expect(await observeCodexRebuildPermissions(fixture({ argv }))).toMatchObject({ state: "observed", profile: "openrig desktop work" });
+  });
+  it("refuses a thread named only inside a spaced option value", async () => {
+    const argv = ["codex", "resume", "--add-dir", "/tmp/fixture-thread", "another-thread"];
+    expect(await observeCodexRebuildPermissions(fixture({ argv }))).toMatchObject({ state: "unverified" });
   });
   it.each(["wrongThread", "stale", "incompleteLatest", "turnover"] as const)(
     "discloses unverified observation on %s, rather than using an older/different policy", async reason => {

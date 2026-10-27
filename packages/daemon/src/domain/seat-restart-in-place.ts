@@ -10,7 +10,7 @@ import type { SessionRegistry } from "./session-registry.js";
 import type { HarnessLaunchResult, NodeBinding } from "./runtime-adapter.js";
 import type { PersistedEvent, RigEvent } from "./types.js";
 import {
-  codexCommandResumeToken, listNativeProcesses, processArgv, verifyCodexPaneProcess,
+  codexProcessResumeToken, listNativeProcesses, processArgv, verifyCodexPaneProcess,
   type NativeProcessLister, type NativeProcessRow,
 } from "./native-process-lineage.js";
 import { CodexThreadIdResolver, resolveCodexDbPaths, type CodexThreadEvidence } from "./codex-thread-id.js";
@@ -412,7 +412,7 @@ export class CodexInPlaceRestart {
     if (!codexHome) return { ok: false, code: "settings_unverified", message: "The running Codex's home could not be determined (no CODEX_HOME or HOME). Nothing was stopped." };
 
     // The conversation the PROCESS is on: argv for a resumed Codex, its own native logs for a fresh one.
-    const argvToken = codexCommandResumeToken(process.command);
+    const argvToken = codexProcessResumeToken(process);
     let conversationProof: "argv" | "native_logs";
     if (argvToken === token) conversationProof = "argv";
     else if (argvToken === undefined && startedAt && (await this.io.readThreadId(process.pid, startedAt, codexHome)) === token) conversationProof = "native_logs";
@@ -468,8 +468,8 @@ export class CodexInPlaceRestart {
     const relaunchBinding: NodeBinding = { ...binding, cwd };
     // The probed and prepared launch choices come from the running Codex, so the relaunch keeps them and no
     // Codex process is started to decide them again.
-    // The exact argv when /proc gives it: a --add-dir with a space (a cwd's .git) must not be cut at the space.
-    const runningArgv = facts.argv?.length ? facts.argv : processArgv(process.command);
+    // Keep the launch settings tied to the same OS argv used for the selected process's identity.
+    const runningArgv = process.argv!;
     const running = runningLaunch(runningArgv);
     const relaunch = await this.deps.codex.buildResumeCommand(relaunchBinding, { name: sessionName, resumeToken: token, running });
     if (!relaunch.ok) return { ok: false, code: "relaunch_unavailable", message: `The resume command could not be built: ${relaunch.error}. Nothing was stopped.` };

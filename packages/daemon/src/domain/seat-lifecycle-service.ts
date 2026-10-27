@@ -39,7 +39,7 @@ import {
   type EffortResolution, type NativeEffortObservation,
 } from "./seat-effort.js";
 import {
-  claudeCommandSessionToken, codexCommandResumeToken, observeClaudePaneRuntime, observeCodexPaneProcess, processArgv,
+  claudeCommandSessionToken, codexProcessResumeToken, observeClaudePaneRuntime, observeCodexPaneProcess, processArgv,
 } from "./native-process-lineage.js";
 import { defaultInPlaceRestartIo } from "./seat-restart-in-place.js";
 import nodePath from "node:path";
@@ -620,7 +620,7 @@ export class SeatLifecycleService {
         emitted = { state: "unknown", detail: `No single ${runtime === "claude-code" ? "Claude" : "Codex"} process could be read in the seat's pane.` };
         observed = { state: "not_verified", detail: "The running process could not be read, so no turn can be tied to its launch." };
       } else {
-        const flag = emittedEffortFromArgv(runtime, processArgv(process.command));
+        const flag = emittedEffortFromArgv(runtime, runtime === "codex" ? process.argv! : processArgv(process.command));
         const value = flag.flag === "present" ? flag.value : null;
         emitted = { state: "observed", value, pid: process.pid, startedAt: process.startedAt ?? null, matchesSaved: value === saved.effective };
         // Native effort is attributed only from the transcript of the conversation this process is on.
@@ -696,7 +696,7 @@ export class SeatLifecycleService {
   /** The transcript of the conversation the observed process is on, or why that join can't be made.
    *  The recorded conversation (Codex: the session's resume token; Claude: the status sidecar's session)
    *  must be the one the process itself names, by argv or, for a Codex that names none, by its own logs. */
-  private async joinedTranscript(runtime: "claude-code" | "codex", session: LatestSessionRow, process: { pid: number; command: string; startedAt?: string }):
+  private async joinedTranscript(runtime: "claude-code" | "codex", session: LatestSessionRow, process: { pid: number; command: string; argv?: string[] | null; startedAt?: string }):
     Promise<{ path: string | null } | { detail: string }> {
     if (!this.transcripts) return { detail: "The native transcript for this session isn't known to OpenRig." };
     const mismatch = "The process in the pane isn't on the conversation recorded for this seat (or its conversation couldn't be read), so no native turn can be attributed to it.";
@@ -704,7 +704,7 @@ export class SeatLifecycleService {
       if (runtime === "codex") {
         const recorded = this.sessionResumeToken(session.id);
         if (!recorded) return { detail: "No Codex conversation is recorded for this session yet." };
-        let own = codexCommandResumeToken(process.command) ?? undefined;
+        let own = codexProcessResumeToken(process) ?? undefined;
         if (own === undefined && process.startedAt) {
           const io = { ...defaultInPlaceRestartIo(), ...this.inPlaceRestartIo };
           const facts = await io.readProcess(process.pid);

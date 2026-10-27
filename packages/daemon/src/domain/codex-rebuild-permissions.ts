@@ -1,7 +1,7 @@
 import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { SessionRegistry } from "./session-registry.js";
-import { observeCodexPaneProcess, codexCommandResumeToken, processArgv, type NativeProcessLister } from "./native-process-lineage.js";
+import { observeCodexPaneProcess, codexProcessResumeToken, type NativeProcessLister } from "./native-process-lineage.js";
 import { lstartToMinTs } from "./codex-thread-id.js";
 import { parseSqliteUtcMs } from "./sqlite-time.js";
 import { shellQuote } from "../adapters/shell-quote.js";
@@ -112,7 +112,7 @@ export async function observeCodexRebuildPermissions(input: {
     const boot = parseSqliteUtcMs(tenure.bootAt);
     if (!first || start === undefined || !Number.isFinite(boot)) return unverified("The predecessor's native process identity or start time was not established.");
     const thread = await input.readThreadId(first.process.pid, first.process.startedAt!);
-    const argvThread = codexCommandResumeToken(first.process.command);
+    const argvThread = codexProcessResumeToken(first.process);
     if (!thread || (argvThread !== undefined && argvThread !== thread)) return unverified("The predecessor's process and native conversation could not be joined.");
     const path = input.rollout(thread);
     const record = path ? readCodexPermissionRecord(path, thread, input.cwd, Math.max(start * 1000 + 999, boot)) : null;
@@ -124,7 +124,7 @@ export async function observeCodexRebuildPermissions(input: {
       || current?.tmuxPane !== binding.tmuxPane || current?.tmuxSession !== binding.tmuxSession) {
       return unverified("The predecessor changed while its native permission policy was read.");
     }
-    const argv = processArgv(first.process.command);
+    const argv = first.process.argv!;
     const profileAt = argv.findIndex(arg => arg === "-p" || arg === "--profile");
     return { state: "observed", ...record, processStartedAt: first.process.startedAt!,
       profile: profileAt >= 0 ? argv[profileAt + 1] ?? null : null };

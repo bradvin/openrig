@@ -279,10 +279,10 @@ describe("SeatLifecycleService.effortReport: four values, each from its own sour
     sessionRegistry.updateResumeToken(session.id, "codex_id", "019a-thread", "scrape");
     return node;
   }
-  function running(args: string) {
+  function running(args: string, argv = ["/usr/local/bin/codex", ...args.split(" ")]) {
     rows = [
       { pid: 100, ppid: 1, pgid: 100, tpgid: 200, executableName: "bash", command: "-bash", startedAt: LSTART },
-      { pid: 200, ppid: 100, pgid: 200, tpgid: 200, executableName: "codex", command: `/usr/local/bin/codex ${args}`, startedAt: LSTART },
+      { pid: 200, ppid: 100, pgid: 200, tpgid: 200, executableName: "codex", command: `/usr/local/bin/codex ${args}`, argv, startedAt: LSTART },
     ];
   }
 
@@ -337,6 +337,21 @@ describe("SeatLifecycleService.effortReport: four values, each from its own sour
     logsThread = "019a-thread";
     expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "observed", value: "low", outcome: "accepted" } });
     logsThread = undefined;
+    expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "not_verified" } });
+  });
+
+  it("joins the exact Codex argv after a spaced profile without attributing an option value as the conversation", async () => {
+    codexSeat({ authored: "low" });
+    transcript = file("rollout-spaced.jsonl", [
+      { type: "turn_context", timestamp: at(5), payload: { turn_id: "a1", effort: "low" } },
+      { type: "event_msg", timestamp: at(7), payload: { type: "task_complete", turn_id: "a1" } },
+    ]);
+    const expected = "019a-thread";
+    const correct = ["/usr/local/bin/codex", "-p", "managed work", "resume", expected];
+    running(correct.slice(1).join(" "), correct);
+    expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "observed", value: "low" } });
+    const wrong = ["/usr/local/bin/codex", "resume", "--add-dir", `/tmp/${expected}`, "019b-other"];
+    running(wrong.slice(1).join(" "), wrong);
     expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "not_verified" } });
   });
 

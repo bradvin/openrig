@@ -12,16 +12,42 @@ describe("native process argv boundaries", () => {
     expect(parseLinuxProcessArguments(Buffer.alloc(1024 * 1024 + 1))).toBeNull();
   });
 
+  it("preserves a leading UTF-8 BOM in each Linux argument", () => {
+    const bytes = Buffer.concat([Buffer.from("codex\0resume\0"), Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from("00000000-0000-7000-8000-000000000001\0")]);
+    expect(parseLinuxProcessArguments(bytes)).toEqual(["codex", "resume", "\ufeff00000000-0000-7000-8000-000000000001"]);
+  });
+
   it.skipIf(process.platform !== "darwin")("parses only declared macOS arguments, rejecting short argc and bad bytes", async () => {
     const fixture = (argc: number, args: Buffer[], environment = Buffer.from("SENTINEL=secret\0")) => {
       const count = Buffer.alloc(4);
       count.writeInt32LE(argc);
-      return Buffer.concat([count, Buffer.from("/usr/bin/node\0\0"), ...args.map(arg => Buffer.concat([arg, Buffer.from([0])])), environment]);
+      const path = Buffer.from("/usr/bin/node\0");
+      const padding = Buffer.alloc((8 - path.length % 8) % 8);
+      return Buffer.concat([count, path, padding, ...args.map(arg => Buffer.concat([arg, Buffer.from([0])])), environment]);
     };
     const valid = fixture(3, [Buffer.from("node"), Buffer.from("例"), Buffer.alloc(0)]);
     expect(await parseMacProcessArgumentsForTest(valid)).toEqual(["node", "例", ""]);
+    expect(JSON.stringify(await parseMacProcessArgumentsForTest(valid))).not.toContain("SENTINEL");
+    // An empty argv[0] is distinct from path padding. Misframing it as padding
+    // would return the first environment variable as argv[argc-1].
+    const emptyFirst = fixture(4, [Buffer.alloc(0), Buffer.from("codex"), Buffer.from("resume"),
+      Buffer.from("00000000-0000-7000-8000-000000000001")], Buffer.from("SENTINEL=environment-not-argv\0"));
+    expect(await parseMacProcessArgumentsForTest(emptyFirst)).toBeNull();
+    expect(await parseMacProcessArgumentsForTest(fixture(2, [Buffer.from("node"), Buffer.from("例")],
+      Buffer.from("UNICODE_SENTINEL=秘密\0")))).toEqual(["node", "例"]);
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const bomArg = Buffer.concat([bom, Buffer.from("00000000-0000-7000-8000-000000000001")]);
+    expect(await parseMacProcessArgumentsForTest(fixture(2, [Buffer.from("node"), bomArg])))
+      .toEqual(["node", "\ufeff00000000-0000-7000-8000-000000000001"]);
+    expect(await parseMacProcessArgumentsForTest(fixture(2, [Buffer.from("node"), Buffer.concat([bom, bom])])))
+      .toEqual(["node", "\ufeff\ufeff"]);
+    expect(await parseMacProcessArgumentsForTest(fixture(2, [Buffer.from("node"), bom])))
+      .toEqual(["node", "\ufeff"]);
     expect(await parseMacProcessArgumentsForTest(fixture(4, [Buffer.from("node"), Buffer.from("resume")], Buffer.alloc(0)))).toBeNull();
     expect(await parseMacProcessArgumentsForTest(fixture(2, [Buffer.from("node"), Buffer.from([0xff])]))).toBeNull();
+    expect(await parseMacProcessArgumentsForTest(valid.subarray(0, 21))).toBeNull();
+    expect(await parseMacProcessArgumentsForTest(Buffer.alloc(1024 * 1024 + 1))).toBeNull();
     expect(await parseMacProcessArgumentsForTest(Buffer.from([1, 0, 0, 0, 110, 111, 100, 101]))).toBeNull();
   });
 

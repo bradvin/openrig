@@ -552,18 +552,22 @@ function candidatesMatching(rows: NativeProcessRow[], panePid: number, runtime: 
   const executable = runtime === "claude-code" ? "claude" : "codex";
   for (const row of rows) {
     const osExecutable = runtime === "claude-code" ? executableName(row.executableName ?? "") : row.executableName;
-    if ((runtime === "claude-code" ? !claudeRow(row)
-      : osExecutable !== executable || !validCodexArgv(row) || executableName(row.argv[0] ?? "") !== executable)
-      || row.pgid !== root.tpgid || row.tpgid !== root.tpgid) continue;
+    if (row.pgid !== root.tpgid || row.tpgid !== root.tpgid) continue;
+    if (runtime === "claude-code" ? !claudeRow(row) : osExecutable !== executable) continue;
+    // An OS-named foreground Codex with unreadable argv or an incomplete ancestry
+    // can still receive input. It must not disappear before uniqueness is checked.
+    if (runtime === "codex" && (!validCodexArgv(row) || executableName(row.argv[0] ?? "") !== executable)) return [];
     const chain: NativeProcessRow[] = [];
     const visited = new Set<number>();
     let current: NativeProcessRow | undefined = row;
+    let belongsToPane = false;
     while (current && !visited.has(current.pid) && current.startedAt) {
       visited.add(current.pid);
       chain.push(current);
-      if (current.pid === panePid) { matches.push({ process: row, chain }); break; }
+      if (current.pid === panePid) { matches.push({ process: row, chain }); belongsToPane = true; break; }
       current = byPid.get(current.ppid);
     }
+    if (runtime === "codex" && !belongsToPane) return [];
   }
   return matches.map(({ process, chain }) => ({ panePid, process,
     fingerprint: JSON.stringify(chain.map(row => runtime === "codex"

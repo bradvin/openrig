@@ -181,6 +181,60 @@ describe("Codex resume options (#1400)", () => {
 });
 
 describe("joined native Codex identity", () => {
+  it("does not turn a BOM-prefixed Linux argument into the expected UUID", async () => {
+    const argv = ["/opt/native/codex", "resume", `\ufeff${token}`];
+    const list = () => rows().map(r => r.pid === 13 ? { ...r, command: argv.join(" "), argv } : r);
+    expect(await check(list)).toBeNull();
+    expect(findExactNativeResumeProcess(list(), 10, "codex", token)).toBeNull();
+  });
+
+  it.each(["child", "sibling", "ancestor"] as const)(
+    "refuses an opaque foreground Codex %s in both stable samples, including exact finder, fork and diagnostics", async place => {
+      const base = rows();
+      const opaque: NativeProcessRow = { ...base[3]!, pid: 14,
+        ppid: place === "child" ? 13 : 12, argv: null, command: `codex resume ${token}` };
+      const list = () => place === "ancestor"
+        ? base.map(r => r.pid === 12 ? { ...r, executableName: "codex", argv: null } : r)
+        : [...base, opaque];
+      expect(await check(list)).toBeNull();
+      expect(findExactNativeResumeProcess(list(), 10, "codex", token)).toBeNull();
+      expect(explainNativeRejection(list(), 10, "codex", token, true)).toEqual({ kind: "no_single_process" });
+      const forkRows = list().map(r => r.pid === 13 ? { ...r, argv: ["codex", "fork", parent], command: `codex fork ${parent}` } : r);
+      expect(await observeCodexForkProcess({ target: "%1", tmux: { getPanePid: async () => 10 },
+        parentToken: parent, listProcesses: () => forkRows })).toBeNull();
+    });
+
+  it("refuses when an opaque foreground Codex appears in only one of two samples", async () => {
+    const base = rows();
+    const opaque = { ...base[3]!, pid: 14, ppid: 13, argv: null };
+    expect(await check(vi.fn().mockResolvedValueOnce(base).mockResolvedValueOnce([...base, opaque]))).toBeNull();
+    expect(await check(vi.fn().mockResolvedValueOnce([...base, opaque]).mockResolvedValueOnce(base))).toBeNull();
+  });
+
+  it.each([
+    ["unreadable", null, startedAt],
+    ["missing", undefined, startedAt],
+    ["malformed", ["codex", "resume", token, "bad\0argument"], startedAt],
+    ["wrong argv0", ["node", "resume", token], startedAt],
+    ["unknown start", ["codex", "resume", token], undefined],
+  ] as const)("keeps a foreground Codex child with %s evidence in uniqueness", async (_case, argv, start) => {
+    const base = rows();
+    const child: NativeProcessRow = { ...base[3]!, pid: 14, ppid: 13, argv: argv as string[] | null | undefined, startedAt: start };
+    const list = () => [...base, child];
+    expect(await check(list)).toBeNull();
+    expect(explainNativeRejection(list(), 10, "codex", token, true)).toEqual({ kind: "no_single_process" });
+  });
+
+  it("keeps readable foreground conflicts and unrelated background Codex separate", async () => {
+    const base = rows();
+    const sibling = { ...base[3]!, pid: 14, ppid: 12 };
+    expect(await check(() => [...base, sibling])).toBeNull();
+    expect(explainNativeRejection([...base, sibling], 10, "codex", token, true)).toEqual({ kind: "no_single_process" });
+    const background = { ...sibling, argv: null, pgid: 14, tpgid: 11 };
+    expect((await check(() => [...base, background]))?.process.pid).toBe(13);
+    expect(explainNativeRejection([...base, background], 10, "codex", token, true)).toEqual({ kind: "passes" });
+  });
+
   it.each([
     ["-C", "/Users/me/Library/Application Support/openrig/shared-docs"],
     ["--add-dir", "/tmp/Bob's \"quoted\" 例"],

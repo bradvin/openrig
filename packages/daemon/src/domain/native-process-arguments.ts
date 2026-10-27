@@ -24,9 +24,17 @@ function parse(data, used) {
   if (typeof bytes !== "string" || bytes.length !== used) return null;
   var argc = number(bytes, 4);
   if (argc < 1 || argc > 4096) return null;
-  var offset = bytes.indexOf("\\u0000", 4);
-  if (offset <= 4) return null;
-  while (offset < used && bytes.charCodeAt(offset) === 0) offset++;
+  var pathEnd = bytes.indexOf("\\u0000", 4);
+  if (pathEnd <= 4) return null;
+  // XNU aligns ip_startargv after the saved path to the target's pointer size.
+  // KERN_PROCARGS2 strips the 16-byte executable_path= prefix. Supported macOS
+  // processes are 64-bit, so the path and its padding occupy whole 8-byte units.
+  // Skipping every zero would also skip an empty argv[0] and read env as argv.
+  var offset = 4 + Math.ceil((pathEnd - 4 + 1) / 8) * 8;
+  if (offset >= used) return null;
+  for (var padding = pathEnd + 1; padding < offset; padding++) {
+    if (bytes.charCodeAt(padding) !== 0) return null;
+  }
   var args = [];
   for (var index = 0; index < argc; index++) {
     if (offset >= used) return null;
@@ -34,10 +42,14 @@ function parse(data, used) {
     if (end < 0 || end >= used) return null;
     var argument = ObjC.unwrap($.NSString.alloc.initWithDataEncoding(exact.subdataWithRange({location: offset, length: end - offset}), $.NSUTF8StringEncoding));
     if (typeof argument !== "string") return null;
+    // NSString consumes a UTF-8 BOM at the start of each decoded unit. Restore
+    // it so a BOM-prefixed token cannot become an exact conversation UUID.
+    if (end - offset >= 3 && bytes.charCodeAt(offset) === 239 && bytes.charCodeAt(offset + 1) === 187
+      && bytes.charCodeAt(offset + 2) === 191) argument = String.fromCharCode(65279) + argument;
     args.push(argument);
     offset = end + 1;
   }
-  return args;
+  return args[0] ? args : null;
 }
 function run(inputs) {
   var data = $.NSMutableData.dataWithLength(1048576);
@@ -68,7 +80,9 @@ function run(inputs) {
 export function parseLinuxProcessArguments(bytes: Buffer): string[] | null {
   if (bytes.length < 2 || bytes.length > MAX_BYTES || bytes.at(-1) !== 0) return null;
   const args: string[] = [];
-  const decoder = new TextDecoder("utf-8", { fatal: true });
+  // TextDecoder strips an initial BOM by default, even when decoding each argv
+  // unit separately. Keep that byte sequence as U+FEFF so it cannot become a UUID.
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   let start = 0;
   try {
     for (let index = 0; index < bytes.length; index++) {

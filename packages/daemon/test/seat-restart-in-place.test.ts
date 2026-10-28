@@ -289,6 +289,28 @@ describe("rig seat restart --keep-conversation: gates before any signal", () => 
     expect(w.events()).toEqual([]);
   });
 
+  it.each([null, undefined, [], ["codex", "resume", TOKEN, "bad\0argument"], ["node", "resume", TOKEN]])(
+    "refuses plan and execution before provider input or stop when exact Codex argv is unusable: %j", async argv => {
+      const w = world({ threadId: TOKEN });
+      w.setRows([shellRow(100, 200), { ...codexRow(200, 100, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`, LSTART, 200), argv }]);
+      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true })).toMatchObject({ ok: false, code: "resume_binding_unverified" });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "new account" })).toMatchObject({ ok: false, code: "resume_binding_unverified" });
+      expect(w.builds).toEqual([]);
+      expect(w.calls).toEqual([]);
+      expect(w.events()).toEqual([]);
+    });
+
+  it("refuses a readable Codex child below an opaque launcher before changing the seat", async () => {
+    const w = world({ threadId: TOKEN });
+    w.setRows([shellRow(100, 200), { ...codexRow(150, 100, "-m configured-model", LSTART, 200), argv: null },
+      codexRow(200, 150, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`, LSTART, 200)]);
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "new account" }))
+      .toMatchObject({ ok: false, code: "resume_binding_unverified" });
+    expect(w.builds).toEqual([]);
+    expect(w.calls).toEqual([]);
+    expect(w.events()).toEqual([]);
+  });
+
   it("mid-turn and needs-input are reported, never refused", async () => {
     const working = await world({ activity: state("working") }).service.restartInPlace({ seatRef: SEAT, reason: "new account" });
     expect(working).toMatchObject({ ok: true, outcome: "restarted_account_unverified", activity: { state: "working" } });

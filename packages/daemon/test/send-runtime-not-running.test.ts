@@ -120,6 +120,29 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     expect(listProcesses).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["ordinary verified send", "queue nudge", "watchdog wake"])("wrapped Codex with unreadable argv still receives %s", async kind => {
+    const opaque = vi.fn(async () => wrapperProcesses().map(row => row.pid === 1205 ? { ...row, argv: null } : row));
+    const { transport, sendText, sendKeys } = wrappedSeat(opaque);
+    const result = kind === "watchdog wake"
+      ? await watchdogSend(transport, "dev-check@my-rig")
+      : await transport.send("dev-check@my-rig", "existing review", {
+        verify: true, ...(kind === "queue nudge" ? { actorSession: "dev-owner@my-rig", auditPointer: "existing-review", deliveryId: "nudge-opaque" } : {}),
+      });
+    expect(result.ok).toBe(true);
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(sendKeys).toHaveBeenCalledOnce();
+    expect(opaque).toHaveBeenCalledTimes(2);
+  });
+
+  it("wrapped Codex with unreadable argv still refuses an approval prompt", async () => {
+    const opaque = vi.fn(async () => wrapperProcesses().map(row => row.pid === 1205 ? { ...row, argv: null } : row));
+    const { transport, tmux, sendText, sendKeys } = wrappedSeat(opaque);
+    tmux.capturePaneContent = async () => "Would you like to run the following command?\n› 1. Yes, proceed (y)\n2. No\nPress enter to confirm or esc to cancel";
+    expect(await transport.send("dev-check@my-rig", "existing review")).toMatchObject({ ok: false, reason: "target_needs_input" });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
+
   it("proven native wrapper still refuses an approval prompt", async () => {
     const { transport, tmux, sendText, sendKeys } = wrappedSeat();
     tmux.capturePaneContent = async () => "Would you like to run the following command?\n› 1. Yes, proceed (y)\n2. No\nPress enter to confirm or esc to cancel";

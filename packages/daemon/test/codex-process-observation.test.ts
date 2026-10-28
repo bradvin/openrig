@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { defaultListProcesses } from "../src/adapters/codex-runtime-adapter.js";
 import { readNativeProcessArguments } from "../src/domain/native-process-arguments.js";
+import { findExactNativeResumeProcess, verifyCodexPaneProcess } from "../src/domain/native-process-lineage.js";
 // The fixture's synthetic PIDs must never inspect host processes.
 vi.mock("../src/domain/native-process-arguments.js", async importOriginal => ({
   ...await importOriginal<typeof import("../src/domain/native-process-arguments.js")>(),
@@ -17,6 +18,8 @@ afterEach(() => {
   restoreProc();
   Object.defineProperty(process, "platform", platform);
   vi.unstubAllEnvs();
+  vi.mocked(readNativeProcessArguments).mockReset();
+  vi.mocked(readNativeProcessArguments).mockResolvedValue(new Map());
   if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
 });
 
@@ -52,6 +55,14 @@ it("reads foreground identity through the real async executable and parser path"
     { pid: 106, ppid: 1, pgid: 106, tpgid: -1, executableName: "tmux: server", startedAt: "Sat Jan  1 12:00:00 2000", command: "tmux new-session -d" },
     { pid: 107, ppid: 1, pgid: 107, tpgid: -1, executableName: "node (vitest 1)", startedAt: "Sat Jan  1 12:00:00 2000", command: "node (vitest 1)" },
   ]);
+  // A rejected helper (including a policy timeout) must leave the table intact.
+  vi.mocked(readNativeProcessArguments).mockRejectedValueOnce(new Error("argv helper rejected"))
+    .mockRejectedValueOnce(new Error("policy timeout"));
+  const observation = await verifyCodexPaneProcess({ target: "%1", tmux: { getPanePid: async () => 101 },
+    listProcesses: defaultListProcesses, expectedToken: "recorded", requireResume: false });
+  expect(observation?.process.pid).toBe(103);
+  expect(observation?.process.argv).toBeNull();
+  expect(findExactNativeResumeProcess(await defaultListProcesses(), 101, "codex", "recorded")).toBeNull();
   fs.writeFileSync(path.join(scratch, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
   expect(await defaultListProcesses()).toEqual([]);
 });
@@ -84,6 +95,30 @@ it("reads foreground identity through the real /proc reader and parser path", as
   expect(readNativeProcessArguments).not.toHaveBeenCalled();
   serveProcRoot(path.join(root, "gone"));
   expect(await defaultListProcesses()).toEqual([]);
+});
+
+it("keeps the foreground Codex deliverable beyond the argv reader's 128-process budget", async () => {
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  scratch = fs.mkdtempSync(path.join(os.tmpdir(), "codex-process-budget-"));
+  const started = "Sat Jan  1 12:00:00 2000";
+  const output = [
+    "PID PPID PGID TPGID UCOMM LSTART COMMAND",
+    `101 1 101 102 zsh ${started} -zsh`,
+    ...Array.from({ length: 128 }, (_, index) => `${200 + index} 1 ${200 + index} ${200 + index} codex ${started} codex resume recorded`),
+    `400 101 102 102 codex ${started} codex resume recorded`,
+    `401 1 401 -1 codex ${started} codex resume recorded`,
+  ];
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  fs.writeFileSync(path.join(scratch, "ps"), `#!/bin/sh\nprintf '%s\\n' ${output.map(quote).join(" ")}\n`, { mode: 0o755 });
+  vi.stubEnv("PATH", scratch);
+  vi.mocked(readNativeProcessArguments).mockImplementation(async requested =>
+    new Map(requested.slice(0, 128).map(pid => [pid, ["codex", "resume", "recorded"]])));
+  const rows = await defaultListProcesses();
+  expect(readNativeProcessArguments).toHaveBeenCalledWith([...Array.from({ length: 128 }, (_, index) => 200 + index), 400]);
+  expect(rows.find(row => row.pid === 400)?.argv).toBeNull();
+  expect((await verifyCodexPaneProcess({ target: "%1", tmux: { getPanePid: async () => 101 },
+    listProcesses: defaultListProcesses, expectedToken: "recorded", requireResume: false }))?.process.pid).toBe(400);
+  expect(findExactNativeResumeProcess(rows, 101, "codex", "recorded")).toBeNull();
 });
 
 it("reads this test process with the installed ps columns, without starting a provider", async () => {

@@ -217,7 +217,8 @@ export function codexCommandResumeToken(command: string): string | null | undefi
 
 /** The native process's own resume identity. Flattened ps text is never positive proof. */
 export function codexProcessResumeToken(row: Pick<NativeProcessRow, "argv">): string | null | undefined {
-  return validCodexArgv(row) ? codexConversationToken(row.argv!.slice(1), "resume", true) : undefined;
+  const argv = codexProcessArgv(row);
+  return argv ? codexConversationToken(argv.slice(1), "resume", true) : undefined;
 }
 
 function validCodexArgv(row: Pick<NativeProcessRow, "argv">): row is { argv: string[] } {
@@ -226,6 +227,11 @@ function validCodexArgv(row: Pick<NativeProcessRow, "argv">): row is { argv: str
     && typeof row.argv[0] === "string" && row.argv[0].length > 0
     && row.argv.every(arg => typeof arg === "string" && !arg.includes("\0")
       && (bytes += Buffer.byteLength(arg)) <= 1024 * 1024);
+}
+
+/** Exact, bounded argv from a process whose argv[0] also names Codex. No ps-text fallback. */
+export function codexProcessArgv(row: Pick<NativeProcessRow, "argv">): string[] | null {
+  return validCodexArgv(row) && executableName(row.argv[0]!) === "codex" ? row.argv : null;
 }
 
 type ClaudeArgvIds = { resume: string | null; "session-id": string | null };
@@ -511,9 +517,15 @@ export async function listNativeProcesses(options: { claudeLaunchPaths?: boolean
     }
     // Linux argv was captured with this same /proc table sample; never read real /proc
     // again after a caller has selected a fixture or alternate process-table root.
-    const codexCandidates = process.platform === "darwin" ? rows.filter(row => row.executableName === "codex") : [];
+    // Only foreground rows can be selected below. Skip macOS helper reads for
+    // background Codex processes; every foreground seat still gets fresh argv.
+    const codexCandidates = process.platform === "darwin"
+      ? rows.filter(row => row.executableName === "codex" && row.pgid !== undefined && row.pgid > 0 && row.pgid === row.tpgid)
+      : [];
     if (codexCandidates.length > 0) {
-      const argumentsByPid = await readNativeProcessArguments(codexCandidates.map(row => row.pid));
+      // A failed or timed-out helper read loses argv evidence, not the process table.
+      // The foreground Codex still participates in delivery's uniqueness check.
+      const argumentsByPid = await readNativeProcessArguments(codexCandidates.map(row => row.pid)).catch(() => new Map<number, string[]>());
       for (const row of codexCandidates) row.argv = argumentsByPid.get(row.pid) ?? null;
     }
     return rows;
@@ -554,9 +566,9 @@ function candidatesMatching(rows: NativeProcessRow[], panePid: number, runtime: 
     const osExecutable = runtime === "claude-code" ? executableName(row.executableName ?? "") : row.executableName;
     if (row.pgid !== root.tpgid || row.tpgid !== root.tpgid) continue;
     if (runtime === "claude-code" ? !claudeRow(row) : osExecutable !== executable) continue;
-    // An OS-named foreground Codex with unreadable argv or an incomplete ancestry
-    // can still receive input. It must not disappear before uniqueness is checked.
-    if (runtime === "codex" && (!validCodexArgv(row) || executableName(row.argv[0] ?? "") !== executable)) return [];
+    // OS-named Codex with unreadable argv still competes for the foreground.
+    // A readable argv[0] naming a different executable is positive contrary evidence.
+    if (runtime === "codex" && validCodexArgv(row) && !codexProcessArgv(row)) return [];
     const chain: NativeProcessRow[] = [];
     const visited = new Set<number>();
     let current: NativeProcessRow | undefined = row;
@@ -575,7 +587,7 @@ function candidatesMatching(rows: NativeProcessRow[], panePid: number, runtime: 
       : [row.pid, row.ppid, row.startedAt, row.pgid, row.tpgid, row.executableName, row.command, row.executablePath])) }));
 }
 
-function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expectedToken?: string | null, requireResume = false, runtime: NativeRuntime = "codex", selectedExecutable?: string, rotation?: ClaudeResumeRotation | null, scriptLaunch?: boolean): NativeProcessObservation | null {
+function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expectedToken?: string | null, requireResume = false, runtime: NativeRuntime = "codex", selectedExecutable?: string, rotation?: ClaudeResumeRotation | null, scriptLaunch?: boolean, requireArgv = false): NativeProcessObservation | null {
   const matches = nativeProcessCandidates(rows, panePid, runtime, selectedExecutable, scriptLaunch);
   // #1079: a Codex launcher that spawns Codex is one runtime on one chain.
   const chain = runtime === "codex" ? launcherChain(matches, rows) : matches;
@@ -593,6 +605,9 @@ function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expected
     // inherited by a child that names nothing, which stays deliverable but unproved.
     const identities = chain.map((link) => codexProcessResumeToken(link.process));
     if (new Set(identities.filter((value) => typeof value === "string")).size > 1) return null;
+    // Exact resume proof needs readable argv across the whole foreground chain:
+    // an opaque launcher may name another conversation even when its child agrees.
+    if ((requireResume || requireArgv) && chain.some((link) => !codexProcessArgv(link.process))) return null;
     if (requireResume && (!expectedToken || identities[0] !== expectedToken)) return null;
     if (expectedToken !== undefined && identities.some((value) => value !== undefined
       && (!expectedToken || value !== expectedToken))) return null;
@@ -650,6 +665,7 @@ export function explainNativeRejection(rows: NativeProcessRow[], panePid: number
   if (new Set(identities.filter((value) => typeof value === "string")).size > 1) return { kind: "conflicting_conversations" };
   if (requireResume) {
     if (!expectedToken) return { kind: "no_recorded_conversation" };
+    if (chain.some((link) => !validCodexArgv(link.process))) return { kind: "not_a_resume" };
     if (identities[0] === undefined) return { kind: "not_a_resume" };
     if (identities[0] === null) return { kind: "names_no_conversation" };
     if (identities[0] !== expectedToken) return { kind: "other_conversation", conversation: identities[0] };
@@ -668,6 +684,8 @@ async function observeNativePaneProcess(input: {
   listProcesses?: NativeProcessLister;
   expectedToken?: string | null;
   requireResume?: boolean;
+  /** Codex only: require exact argv on every chain link without requiring a resume (fresh launches remain eligible). */
+  requireArgv?: boolean;
   /** Canonical executable frozen by the managed launch, never re-resolved at observation time. */
   selectedExecutable?: string;
   /** Claude only: the frozen executable is a `#!` script, so a process whose OS executable path is named `claude` is
@@ -682,7 +700,7 @@ async function observeNativePaneProcess(input: {
     if (!pid) return null;
     const rows = await (input.listProcesses ?? (() => listNativeProcesses({ claudeLaunchPaths: input.scriptLaunch === true })))();
     return selectNativeProcess(rows, pid, input.expectedToken, input.requireResume, runtime, input.selectedExecutable,
-      runtime === "claude-code" ? input.rotation : undefined, input.scriptLaunch);
+      runtime === "claude-code" ? input.rotation : undefined, input.scriptLaunch, input.requireArgv);
   } catch { return null; }
 }
 
@@ -704,7 +722,14 @@ export async function observeCodexForkProcess(input: {
     const rows = await (input.listProcesses ?? listNativeProcesses)();
     const chain = launcherChain(nativeProcessCandidates(rows, pid, "codex"), rows);
     if (!chain?.length) return null;
-    const args = chain.map(link => link.process.argv!.slice(1));
+    // A fork is positive history proof. Every chain link must have exact argv,
+    // including the selected child and any launcher that could name a conflict.
+    const args: string[][] = [];
+    for (const link of chain) {
+      const argv = codexProcessArgv(link.process);
+      if (!argv) return null;
+      args.push(argv.slice(1));
+    }
     const parents = args.map(argv => codexConversationToken(argv, "fork", true));
     if (!parents.includes(input.parentToken)
       || parents.some(parent => parent !== undefined && parent !== input.parentToken)

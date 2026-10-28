@@ -355,6 +355,38 @@ describe("SeatLifecycleService.effortReport: four values, each from its own sour
     expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "not_verified" } });
   });
 
+  it.each([null, undefined, [], ["codex", "resume", "019a-thread", "bad\0argument"], ["node", "resume", "019a-thread"]])(
+    "keeps effort unknown when the selected Codex has no usable exact argv: %j", async argv => {
+      codexSeat({ authored: "high" });
+      running(`-c model_reasoning_effort="high" resume 019a-thread`);
+      rows[1]!.argv = argv;
+      logsThread = "019a-thread";
+      transcript = file("opaque-rollout.jsonl", [
+        { type: "turn_context", timestamp: at(5), payload: { turn_id: "a1", effort: "high" } },
+        { type: "event_msg", timestamp: at(7), payload: { type: "task_complete", turn_id: "a1" } },
+      ]);
+      expect(await service.effortReport("dev-codex@eff")).toMatchObject({
+        ok: true, emitted: { state: "unknown" }, observed: { state: "not_verified" },
+      });
+    });
+
+  it("keeps native effort unverified when a readable child sits below an opaque Codex launcher", async () => {
+    codexSeat({ authored: "high" });
+    running(`-c model_reasoning_effort="high" resume 019a-thread`);
+    rows[0]!.tpgid = 200;
+    rows[1]!.ppid = 150;
+    rows.splice(1, 0, { pid: 150, ppid: 100, pgid: 200, tpgid: 200, executableName: "codex",
+      command: "codex -m configured-model", argv: null, startedAt: LSTART });
+    logsThread = "019a-thread";
+    transcript = file("opaque-launcher-rollout.jsonl", [
+      { type: "turn_context", timestamp: at(5), payload: { turn_id: "a1", effort: "high" } },
+      { type: "event_msg", timestamp: at(7), payload: { type: "task_complete", turn_id: "a1" } },
+    ]);
+    expect(await service.effortReport("dev-codex@eff")).toMatchObject({
+      ok: true, emitted: { state: "unknown" }, observed: { state: "not_verified" },
+    });
+  });
+
   it("joins a Claude process to its sidecar session by argv, or by a recorded resume rotation", async () => {
     const rig = rigRepo.createRig("effc");
     const node = rigRepo.addNode(rig.id, "dev.claude", { runtime: "claude-code", cwd: "/w", effort: "high" });

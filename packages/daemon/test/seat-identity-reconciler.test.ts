@@ -203,6 +203,14 @@ describe("A3 Claude shell sampling", () => {
     expect(f.tmux.getPaneCommand).toHaveBeenCalledTimes(1);
   });
 
+  it.each([null, [], ["codex", "resume", "saved-token", "bad\0argument"]])(
+    "does not mark a Codex identity verified from an opaque argv: %j", async argv => {
+      const f = fixture("codex", "codex");
+      f.listProcesses.mockImplementation(async () => f.rows().map(row => row.executableName === "codex" ? { ...row, argv } : row));
+      await f.rec.reconcileAll();
+      expect(f.verdict()?.verdict).toBe("mismatch");
+    });
+
   it("fences a stop during the early command observation before process sampling or publication", async () => {
     const f = fixture();
     let release!: () => void;

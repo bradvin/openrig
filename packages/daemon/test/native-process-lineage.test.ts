@@ -189,16 +189,19 @@ describe("joined native Codex identity", () => {
   });
 
   it.each(["child", "sibling", "ancestor"] as const)(
-    "refuses an opaque foreground Codex %s in both stable samples, including exact finder, fork and diagnostics", async place => {
+    "keeps an opaque foreground Codex %s in uniqueness without proving its history", async place => {
       const base = rows();
       const opaque: NativeProcessRow = { ...base[3]!, pid: 14,
         ppid: place === "child" ? 13 : 12, argv: null, command: `codex resume ${token}` };
       const list = () => place === "ancestor"
         ? base.map(r => r.pid === 12 ? { ...r, executableName: "codex", argv: null } : r)
         : [...base, opaque];
+      const delivered = await check(list, { requireResume: false });
+      expect(delivered?.process.pid ?? null).toBe(place === "sibling" ? null : place === "child" ? 14 : 13);
       expect(await check(list)).toBeNull();
       expect(findExactNativeResumeProcess(list(), 10, "codex", token)).toBeNull();
-      expect(explainNativeRejection(list(), 10, "codex", token, true)).toEqual({ kind: "no_single_process" });
+      expect(explainNativeRejection(list(), 10, "codex", token, true)).toEqual({ kind: place === "sibling" ? "no_single_process" : "not_a_resume" });
+      expect(explainNativeRejection(list(), 10, "codex", token, false)).toEqual({ kind: place === "sibling" ? "no_single_process" : "passes" });
       const forkRows = list().map(r => r.pid === 13 ? { ...r, argv: ["codex", "fork", parent], command: `codex fork ${parent}` } : r);
       expect(await observeCodexForkProcess({ target: "%1", tmux: { getPanePid: async () => 10 },
         parentToken: parent, listProcesses: () => forkRows })).toBeNull();
@@ -211,6 +214,52 @@ describe("joined native Codex identity", () => {
     expect(await check(vi.fn().mockResolvedValueOnce([...base, opaque]).mockResolvedValueOnce(base))).toBeNull();
   });
 
+  it("delivers to one stable opaque Codex while denying exact proof", async () => {
+    const only = { ...rows()[3]!, pid: 10, ppid: 1, argv: null };
+    const list = () => [only];
+    expect((await check(list, { requireResume: false }))?.process.pid).toBe(10);
+    expect(await check(list, { requireResume: false, requireArgv: true })).toBeNull();
+    expect(await check(list)).toBeNull();
+    expect(findExactNativeResumeProcess(list(), 10, "codex", token)).toBeNull();
+    expect(explainNativeRejection(list(), 10, "codex", token, false)).toEqual({ kind: "passes" });
+    expect(explainNativeRejection(list(), 10, "codex", token, true)).toEqual({ kind: "not_a_resume" });
+  });
+
+  it("requires every chain link's exact argv for strict fresh-process consumers", async () => {
+    const base = rows();
+    const list = () => base.map(row => row.pid === 12 ? { ...row, executableName: "codex", command: "codex -m model", argv: null }
+      : row.pid === 13 ? { ...row, command: "codex -m model", argv: ["codex", "-m", "model"] } : row);
+    expect((await check(list, { requireResume: false, expectedToken: undefined }))?.process.pid).toBe(13);
+    expect(await check(list, { requireResume: false, expectedToken: undefined, requireArgv: true })).toBeNull();
+    const fresh = () => base.map(row => row.pid === 13 ? { ...row, command: "codex -m model", argv: ["codex", "-m", "model"] } : row);
+    expect((await check(fresh, { requireResume: false, expectedToken: undefined, requireArgv: true }))?.process.pid).toBe(13);
+  });
+
+  it("does not deliver when a readable launcher names a conflicting conversation above an opaque child", async () => {
+    const wrong = "00000000-0000-7000-8000-000000000002";
+    const base = rows();
+    const launcher = { ...base[3]!, argv: ["codex", "resume", wrong], command: `codex resume ${wrong}` };
+    const child = { ...base[3]!, pid: 14, ppid: 13, argv: null };
+    const list = () => [...base.slice(0, -1), launcher, child];
+    expect(await check(list, { requireResume: false })).toBeNull();
+    expect(explainNativeRejection(list(), 10, "codex", token, false)).toEqual({ kind: "other_conversation", conversation: wrong });
+  });
+
+  it("refuses delivery when argv availability changes between independent samples", async () => {
+    const readable = rows();
+    const opaque = readable.map(row => row.pid === 13 ? { ...row, argv: null } : row);
+    expect(await check(vi.fn().mockResolvedValueOnce(readable).mockResolvedValueOnce(opaque), { requireResume: false })).toBeNull();
+    expect(await check(vi.fn().mockResolvedValueOnce(opaque).mockResolvedValueOnce(readable), { requireResume: false })).toBeNull();
+  });
+
+  it("retains more than 128 opaque foreground candidates in the uniqueness check", async () => {
+    const base = rows();
+    const many = Array.from({ length: 129 }, (_, index): NativeProcessRow => ({ ...base[3]!, pid: 1000 + index, ppid: 12, argv: null }));
+    const list = () => [...base, ...many];
+    expect(await check(list, { requireResume: false })).toBeNull();
+    expect(explainNativeRejection(list(), 10, "codex", token, false)).toEqual({ kind: "no_single_process" });
+  });
+
   it.each([
     ["unreadable", null, startedAt],
     ["missing", undefined, startedAt],
@@ -221,8 +270,9 @@ describe("joined native Codex identity", () => {
     const base = rows();
     const child: NativeProcessRow = { ...base[3]!, pid: 14, ppid: 13, argv: argv as string[] | null | undefined, startedAt: start };
     const list = () => [...base, child];
+    expect((await check(list, { requireResume: false }))?.process.pid ?? null).toBe(start && _case !== "wrong argv0" ? 14 : null);
     expect(await check(list)).toBeNull();
-    expect(explainNativeRejection(list(), 10, "codex", token, true)).toEqual({ kind: "no_single_process" });
+    expect(explainNativeRejection(list(), 10, "codex", token, true)).toEqual({ kind: start && _case !== "wrong argv0" ? "not_a_resume" : "no_single_process" });
   });
 
   it("keeps readable foreground conflicts and unrelated background Codex separate", async () => {
@@ -261,12 +311,14 @@ describe("joined native Codex identity", () => {
   });
   it.each([[undefined], [null], [[]], [[""]], [["codex", "resume", token, "bad\0argument"]]])("refuses missing or malformed exact argv: %j", async argv => {
     const list = () => rows().map(r => r.pid === 13 ? { ...r, argv } : r);
+    expect((await check(list, { requireResume: false }))?.process.pid).toBe(13);
     expect(await check(list)).toBeNull();
     expect(findExactNativeResumeProcess(list(), 10, "codex", token)).toBeNull();
-    expect(explainNativeRejection(list(), 10, "codex", token, true)).not.toEqual({ kind: "passes" });
+    expect(explainNativeRejection(list(), 10, "codex", token, true)).toEqual({ kind: "not_a_resume" });
   });
   it("refuses an over-budget injected argv even if its prefix names the right conversation", async () => {
     const argv = ["/opt/native/codex", "resume", token, "x".repeat(1024 * 1024)];
+    expect((await check(() => rows().map(r => r.pid === 13 ? { ...r, argv } : r), { requireResume: false }))?.process.pid).toBe(13);
     expect(await check(() => rows().map(r => r.pid === 13 ? { ...r, argv } : r))).toBeNull();
   });
   it("rejects changed argv boundaries even when the flattened command is identical", async () => {

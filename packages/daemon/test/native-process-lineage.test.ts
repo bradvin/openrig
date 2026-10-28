@@ -259,7 +259,7 @@ describe("joined native Codex identity", () => {
     const argv = ["/opt/native/codex", "resume", other, `review ${token}`];
     expect(await check(() => rows().map(r => r.pid === 13 ? { ...r, command: argv.join(" "), argv } : r))).toBeNull();
   });
-  it.each([undefined, null, [], [""], ["codex", "resume", token, "bad\0argument"]])("refuses missing or malformed exact argv: %s", async argv => {
+  it.each([[undefined], [null], [[]], [[""]], [["codex", "resume", token, "bad\0argument"]]])("refuses missing or malformed exact argv: %j", async argv => {
     const list = () => rows().map(r => r.pid === 13 ? { ...r, argv } : r);
     expect(await check(list)).toBeNull();
     expect(findExactNativeResumeProcess(list(), 10, "codex", token)).toBeNull();
